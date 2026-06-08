@@ -1,0 +1,20 @@
+[book]
+title = "k3x-HERA-RT"
+authors = ["k3x-HERA-RT"]
+description = "K3x HERA-RT project notes and development logs."
+language = "zh-CN"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/Dirinkbottle/k3x-HERA-RT"
+edit-url-template = "https://github.com/Dirinkbottle/k3x-HERA-RT/edit/main/{path}"
+
+[output.html.fold]
+enable = true
+level = 0
