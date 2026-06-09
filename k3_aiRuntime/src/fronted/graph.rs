@@ -175,6 +175,7 @@ impl AiGraphBlob {
     ) -> Result<Self, AiGraphBuildError> {
         let node_count = u32::try_from(nodes.len()).map_err(|_| AiGraphBuildError::TooManyNodes)?;
         let edge_count = u32::try_from(edges.len()).map_err(|_| AiGraphBuildError::TooManyEdges)?;
+        validate_graph(nodes, edges)?;
 
         let header_size = mem::size_of::<AiGraphHeader>();
         let nodes_size = mem::size_of_val(nodes);
@@ -307,13 +308,32 @@ impl GraphManager {
         depend: AiGraphChainId,
         desc: AiKernelDesc,
     ) -> Result<AiGraphChainId, AiGraphBuildError> {
-        self.validate_node_id(depend)?;
+        self.push_kernel_depend_many(&[depend], desc)
+    }
 
+    /// 添加一个依赖多条链尾的算子。
+    ///
+    /// 例如 `a -> b, c -> b` 可以写成 `push_kernel_depend_many(&[a, c], b_desc)`。
+    pub fn push_kernel_depend_many(
+        &mut self,
+        depends: &[AiGraphChainId],
+        desc: AiKernelDesc,
+    ) -> Result<AiGraphChainId, AiGraphBuildError> {
+        for &depend in depends {
+            self.validate_node_id(depend)?;
+        }
+
+        let edge_base = self.edges.len();
         let node_id = self.push_node(desc)?;
-        self.edges.push(AiGraphEdge {
-            from_node: depend.0,
-            to_node: node_id.0,
-        });
+
+        for &depend in depends {
+            if let Err(err) = self.push_edge_checked(depend, node_id) {
+                self.edges.truncate(edge_base);
+                self.nodes.pop();
+                return Err(err);
+            }
+        }
+
         Ok(node_id)
     }
 
@@ -336,6 +356,50 @@ impl GraphManager {
         }
         Ok(())
     }
+
+    fn push_edge_checked(
+        &mut self,
+        from: AiGraphNodeId,
+        to: AiGraphNodeId,
+    ) -> Result<(), AiGraphBuildError> {
+        self.validate_node_id(from)?;
+        self.validate_node_id(to)?;
+
+        if from == to || self.reaches(to.0, from.0) {
+            return Err(AiGraphBuildError::CycleDetected);
+        }
+
+        self.edges.push(AiGraphEdge {
+            from_node: from.0,
+            to_node: to.0,
+        });
+        Ok(())
+    }
+
+    fn reaches(&self, start: u32, target: u32) -> bool {
+        let mut stack = vec![start];
+        let mut visited = vec![false; self.nodes.len()];
+
+        while let Some(node_id) = stack.pop() {
+            if node_id == target {
+                return true;
+            }
+
+            let idx = node_id as usize;
+            if idx >= visited.len() || visited[idx] {
+                continue;
+            }
+
+            visited[idx] = true;
+            for edge in &self.edges {
+                if edge.from_node == node_id {
+                    stack.push(edge.to_node);
+                }
+            }
+        }
+
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -343,6 +407,7 @@ pub enum AiGraphBuildError {
     TooManyNodes,
     TooManyEdges,
     InvalidDepend(AiGraphNodeId),
+    CycleDetected,
     SizeOverflow,
 }
 
@@ -445,6 +510,67 @@ fn checked_section(
     Ok(start..end)
 }
 
+fn validate_graph(nodes: &[AiGraphNode], edges: &[AiGraphEdge]) -> Result<(), AiGraphBuildError> {
+    for (idx, node) in nodes.iter().enumerate() {
+        if node.node_id != idx as u32 {
+            return Err(AiGraphBuildError::InvalidDepend(AiGraphNodeId(
+                node.node_id,
+            )));
+        }
+    }
+
+    for edge in edges {
+        if edge.from_node as usize >= nodes.len() {
+            return Err(AiGraphBuildError::InvalidDepend(AiGraphNodeId(
+                edge.from_node,
+            )));
+        }
+        if edge.to_node as usize >= nodes.len() {
+            return Err(AiGraphBuildError::InvalidDepend(AiGraphNodeId(
+                edge.to_node,
+            )));
+        }
+    }
+
+    if has_cycle(nodes.len(), edges) {
+        return Err(AiGraphBuildError::CycleDetected);
+    }
+
+    Ok(())
+}
+
+fn has_cycle(node_count: usize, edges: &[AiGraphEdge]) -> bool {
+    let mut indegree = vec![0_usize; node_count];
+    let mut outgoing = vec![Vec::new(); node_count];
+
+    for edge in edges {
+        let from = edge.from_node as usize;
+        let to = edge.to_node as usize;
+        outgoing[from].push(to);
+        indegree[to] += 1;
+    }
+
+    let mut ready = Vec::new();
+    for (idx, degree) in indegree.iter().enumerate() {
+        if *degree == 0 {
+            ready.push(idx);
+        }
+    }
+
+    let mut visited = 0_usize;
+    while let Some(node) = ready.pop() {
+        visited += 1;
+        for &next in &outgoing[node] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.push(next);
+            }
+        }
+    }
+
+    visited != node_count
+}
+
 const _: () = assert!(core::mem::align_of::<AiGraphSubmitEntry>() == 64);
 const _: () = assert!(core::mem::align_of::<AiGraphNode>() == 64);
 
@@ -453,6 +579,7 @@ mod tests {
     use super::*;
 
     #[test]
+    ///基础插入测试
     fn build_parse_chain() {
         let mut graph = GraphManager::new();
 
@@ -477,11 +604,62 @@ mod tests {
     }
 
     #[test]
+    /// 坏节点检测
     fn reject_bad_depend() {
         let mut graph = GraphManager::new();
         let err = graph
             .push_kernel_depend(AiGraphNodeId(99), AiKernelDesc::default())
             .unwrap_err();
         assert_eq!(err, AiGraphBuildError::InvalidDepend(AiGraphNodeId(99)));
+    }
+
+    #[test]
+    /// 多依赖图测试
+    fn build_parse_join_and_fork() {
+        let mut graph = GraphManager::new();
+
+        let a = graph
+            .push_kernel_no_depend(AiKernelDesc::default())
+            .unwrap();
+        let c = graph
+            .push_kernel_no_depend(AiKernelDesc::default())
+            .unwrap();
+        let b = graph
+            .push_kernel_depend_many(&[a, c], AiKernelDesc::default())
+            .unwrap();
+        let _d = graph
+            .push_kernel_depend(b, AiKernelDesc::default())
+            .unwrap();
+        let _e = graph
+            .push_kernel_depend(b, AiKernelDesc::default())
+            .unwrap();
+
+        let blob = graph.freeze().unwrap();
+        let parsed = AiGraphParser::parse(blob.as_bytes()).unwrap();
+
+        assert_eq!(parsed.header.node_count, 5);
+        assert_eq!(parsed.header.edge_count, 4);
+        assert_eq!(parsed.edges[0].from_node, a.0);
+        assert_eq!(parsed.edges[0].to_node, b.0);
+        assert_eq!(parsed.edges[1].from_node, c.0);
+        assert_eq!(parsed.edges[1].to_node, b.0);
+        assert_eq!(parsed.edges[2].from_node, b.0);
+        assert_eq!(parsed.edges[3].from_node, b.0);
+    }
+
+    #[test]
+    /// 环检测
+    fn reject_cycle_edge_insert() {
+        let mut graph = GraphManager::new();
+
+        let a = graph
+            .push_kernel_no_depend(AiKernelDesc::default())
+            .unwrap();
+        let b = graph
+            .push_kernel_depend(a, AiKernelDesc::default())
+            .unwrap();
+
+        let err = graph.push_edge_checked(b, a).unwrap_err();
+        assert_eq!(err, AiGraphBuildError::CycleDetected);
     }
 }

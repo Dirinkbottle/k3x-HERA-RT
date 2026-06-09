@@ -6,10 +6,10 @@
 
 pub mod desc;
 pub mod graph;
+pub mod kd_uring;
 pub mod kernel;
 pub mod kernelattr;
 pub mod tensor;
-pub mod kd_uring;
 
 // ── 子模块 re-export ──────────────────────────────────────────
 
