@@ -1,11 +1,11 @@
-//! 提交给内核的 tensor 描述、submit entry 和 completion entry。
+//! 提交给内核的 tensor 描述、单算子描述和 completion entry。
 //!
 //! 这些结构只描述用户态 buffer，不拥有内存。
-//! 内核收到 submit entry 后必须校验 `user_va..user_va+size_bytes` 是否有效，
+//! 内核收到 graph 后必须校验 `user_va..user_va+size_bytes` 是否有效，
 //! 并在执行期间 pin 住相关页帧，不能相信"用户态库保证有效"。
 
 use super::kernel::{AiTargetHint, KernelOp};
-use super::{AI_ABI_VERSION, ATTR_INLINE_SIZE, MAX_DIM, MAX_SUBMIT_TENSORS};
+use super::{ATTR_INLINE_SIZE, MAX_DIM, MAX_SUBMIT_TENSORS};
 
 /// tensor 元素类型。
 ///
@@ -159,29 +159,19 @@ impl AiTensorDesc {
     }
 }
 
-/// 提交队列中的一条任务描述。
+/// 单个 lowered 算子的稳定描述。
 ///
-/// 这个结构可以被完整复制进 SQ ring。
+/// 这个结构不直接进 SQ ring，而是作为 graph node 的主体放进 graph blob。
 /// 内核调度器按 `op` 解释 `attr_inline`，按 input/output count 解释 tensors。
+/// 对齐cacheline大小
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-pub struct AiSubmitEntry {
-    /// ABI 版本，必须等于 AI_ABI_VERSION。
-    pub abi_version: u32,
-
+pub struct AiKernelDesc {
     /// 语义级 op。它不是 backend job，也不是最终硬件目标。
     pub op: KernelOp,
 
     /// 用户态对目标的倾向。最终执行位置由调度器决定。
     pub target_hint: AiTargetHint,
-
-    /// 预留字段，保持 8 字节对齐。
-    pub reserved0: u32,
-
-    /// 用户态 completion cookie。
-    ///
-    /// 用户态用它匹配乱序完成的 job/node/graph。
-    pub user_token: u64,
 
     /// 输入 tensor 数量。输入必须放在 tensors 数组前部。
     pub input_count: u32,
@@ -192,11 +182,11 @@ pub struct AiSubmitEntry {
     /// 输入和输出 tensor 描述数组。
     pub tensors: [AiTensorDesc; MAX_SUBMIT_TENSORS],
 
+    /// 预留字段，保持后续 ABI 可扩展。
+    pub reserved0: u32,
+
     /// attr_inline 中有效字节数。
     pub attr_size: u32,
-
-    /// 对齐填充，让 attr_inline 从 8 字节边界开始，避免非对齐。
-    pub attr_align_pad: u32,
 
     /// 内联算子参数。
     ///
@@ -204,25 +194,22 @@ pub struct AiSubmitEntry {
     pub attr_inline: [u8; ATTR_INLINE_SIZE],
 }
 
-impl Default for AiSubmitEntry {
+impl Default for AiKernelDesc {
     fn default() -> Self {
         Self {
-            abi_version: AI_ABI_VERSION,
             op: KernelOp::INVALID,
             target_hint: AiTargetHint::AUTO,
-            reserved0: 0,
-            user_token: 0,
             input_count: 0,
             output_count: 0,
             tensors: [AiTensorDesc::default(); MAX_SUBMIT_TENSORS],
+            reserved0: 0,
             attr_size: 0,
-            attr_align_pad: 0,
             attr_inline: [0; ATTR_INLINE_SIZE],
         }
     }
 }
 
-impl AiSubmitEntry {
+impl AiKernelDesc {
     /// 写入内联 attr。
     ///
     /// 只应该传入本模块内定义的 `#[repr(C)] + Copy` attr 结构。
@@ -260,6 +247,6 @@ pub struct AiCompletionEntry {
 
 // ── 编译期大小/对齐断言 ──────────────────────────────────────
 
-const _: () = assert!(core::mem::align_of::<AiSubmitEntry>() == 64);
+const _: () = assert!(core::mem::align_of::<AiKernelDesc>() == 64);
 const _: () = assert!(core::mem::align_of::<AiCompletionEntry>() == 64);
-const _: () = assert!(core::mem::offset_of!(AiSubmitEntry, attr_inline) % 8 == 0);
+const _: () = assert!(core::mem::offset_of!(AiKernelDesc, attr_inline) % 8 == 0);
