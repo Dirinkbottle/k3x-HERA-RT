@@ -20,9 +20,9 @@
 ### 阶段一子任务拆分
 
 - [ ] 用户态 frontend 与 ring API（3 天）
-  - [ ] 用户态 frontend 小 DAG、算子结构体与调用入口
+  - [x] 用户态 frontend 小 DAG、算子结构体与调用入口
   - [ ] 用户态 backend 算子库骨架
-  - [ ] 最小 MatMul UAPI / submit struct / ring entry
+  - [x] 最小 MatMul UAPI / submit struct / ring entry
   - [ ] graph submit 到 ring
   - [ ] uring 用户 API
 - [ ] 纯线程内核执行路径（3 天）
