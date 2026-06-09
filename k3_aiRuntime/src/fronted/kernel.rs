@@ -10,7 +10,7 @@
 /// 会带来未定义行为。`repr(transparent)` newtype 允许任意 u32，内核可以显式 validate。
 #[repr(transparent)]
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
-pub struct KernelOp(pub u32);
+pub struct KernelOp(pub u8);
 
 impl KernelOp {
     /// 非法/空 op。0 保留出来，避免默认初始化后被误认为有效 op。
@@ -35,7 +35,7 @@ impl KernelOp {
 /// hint，最终执行位置由调度器决定。
 #[repr(transparent)]
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
-pub struct AiTargetHint(pub u32);
+pub struct AiTargetHint(pub u8);
 
 impl AiTargetHint {
     pub const AUTO: Self = Self(0);
