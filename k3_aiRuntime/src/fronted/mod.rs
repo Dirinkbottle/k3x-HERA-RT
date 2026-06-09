@@ -5,15 +5,22 @@
 //! 这些结构后续会被复制到 ring entry 里，再由内核调度器校验、pin buffer、选择 backend。
 
 pub mod desc;
+pub mod graph;
 pub mod kernel;
 pub mod kernelattr;
 pub mod tensor;
+pub mod kd_uring;
 
 // ── 子模块 re-export ──────────────────────────────────────────
 
 pub use desc::{
-    AiCompletionEntry, AiDtype, AiQuantDesc, AiSubmitEntry, AiTensorDesc, AiTensorFormat,
+    AiCompletionEntry, AiDtype, AiKernelDesc, AiQuantDesc, AiTensorDesc, AiTensorFormat,
     AiTensorLayout,
+};
+pub use graph::{
+    AI_GRAPH_MAGIC, AiGraphBlob, AiGraphBuildError, AiGraphChainId, AiGraphEdge, AiGraphHeader,
+    AiGraphNode, AiGraphNodeId, AiGraphParseError, AiGraphParser, AiGraphSubmitEntry,
+    AiParsedGraph, GraphManager, GraphSubmitKind,
 };
 pub use kernel::{AiTargetHint, KernelOp};
 pub use kernelattr::{
