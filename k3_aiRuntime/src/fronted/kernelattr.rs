@@ -1,7 +1,7 @@
 //! 算子内联参数（attr）定义。
 //!
 //! 每个算子对应一个 `#[repr(C)] + Copy` 的 attr 结构，
-//! 通过 `AiSubmitEntry::set_inline_attr` 写入 submit entry 的 `attr_inline` 区域。
+//! 通过 `AiKernelDesc::set_inline_attr` 写入单算子描述的 `attr_inline` 区域。
 //! 所有 attr 结构必须在编译期断言为固定大小，方便内核侧做大小校验。
 
 use super::desc::AiDtype;
