@@ -5,6 +5,7 @@
 //! 并在执行期间 pin 住相关页帧，不能相信"用户态库保证有效"。
 
 use super::kernel::{AiTargetHint, KernelOp};
+use super::kernelattr::AiKernelAttr;
 use super::{ATTR_INLINE_SIZE, MAX_DIM, MAX_SUBMIT_TENSORS};
 
 /// tensor 元素类型。
@@ -87,12 +88,14 @@ pub struct AiQuantDesc {
 /// 提交给内核的 tensor 描述。
 ///
 /// 这个结构只描述用户态 buffer，不拥有内存。
-/// 内核收到 submit entry 后必须校验 `user_va..user_va+size_bytes` 是否有效，
-/// 并在执行期间 pin 住相关页帧，不能相信"用户态库保证有效"。
+/// 目前由内核驱动分配连续的物理页帧
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AiTensorDesc {
-    /// 用户态虚拟地址。UAPI 中使用整数地址，不使用 Rust/C 指针类型。
+    /// 由内核驱动分配的内存凭证token
+    pub kernel_token:u64,
+
+    /// 用户态虚拟地址。
     pub user_va: u64,
 
     /// 该 tensor 可访问的完整 buffer 字节数。
@@ -111,66 +114,127 @@ pub struct AiTensorDesc {
     pub ndim: u32,
 
     /// tensor flags。具体含义由 frontend/backend 约定。
-    pub flags: u32,
+    /// TODO:
+    pub flags: u8,
 
-    /// 预留字段，保持 8 字节对齐，也给后续 ABI 扩展留空间。
+    /// 预留字段，保持 8 字节对齐，ABI 扩展留空间。
     pub reserved0: u32,
 
     /// 每个维度的元素数量。
     pub shape: [u32; MAX_DIM],
 
     /// 每个维度前进 1 个元素时跨过的字节数。
-    // TODO:
-    //     pub stride_bytes: [u64; MAX_DIM],
+    pub stride_bytes: [u64; MAX_DIM],
 
     /// 量化补充信息。
     pub quant: AiQuantDesc,
 }
 
 impl AiTensorDesc {
-    /// 从已经存在的用户态 buffer 构造 tensor 描述。
+    /// 从内核 allocator 返回的信息构造 tensor 描述。
     ///
-    /// 该函数只填描述，不会 pin 内存，也不会检查地址是否真的有效。
-    /// 真正的地址校验必须在内核 submit/pin 路径完成。
-    pub(crate) fn from_buffer(
+    /// 由用户态 tensor allocator 包装层调用。真实 tensor 空间由内核
+    /// allocator 分配，`kernel_token` 是后续 submit/bind/free 的可信身份。
+    pub(crate) fn from_kernel_alloc(
+        kernel_token: u64,
         user_va: u64,
         size_bytes: u64,
         dtype: AiDtype,
         format: AiTensorFormat,
         layout: AiTensorLayout,
         shape: &[u32],
-        _element_size_bytes: u32,
+        _flags:u8
     ) -> Self {
         assert!(shape.len() <= MAX_DIM);
 
         let mut desc = Self {
+            kernel_token,
             user_va,
             size_bytes,
             dtype,
             format,
             layout,
             ndim: shape.len() as u32,
-            flags: 0,
+            flags: _flags,
             ..Self::default()
         };
 
         desc.shape[..shape.len()].copy_from_slice(shape);
         desc
     }
+
+    /// 调用内核 allocator 分配 tensor desc 和实际 tensor 空间。
+    pub(crate) fn alloc_from_kernel(
+        dtype: AiDtype,
+        format: AiTensorFormat,
+        layout: AiTensorLayout,
+        shape: &[u32],
+        flags: u8,
+    ) -> Self {
+        let element_size = dtype
+            .element_size_bytes()
+            .expect("quantized or unknown dtype needs explicit allocator path");
+        let size_bytes = tensor_size_bytes(shape, element_size);
+
+        let alloc = kernel_alloc_tensor(size_bytes);
+        Self::from_kernel_alloc(
+            alloc.kernel_token,
+            alloc.user_va,
+            alloc.actual_size,
+            dtype,
+            format,
+            layout,
+            shape,
+            flags,
+        )
+    }
+
+    /// 释放由内核 allocator 分配的 tensor。
+    pub(crate) fn free(&mut self) {
+        if self.kernel_token == 0 {
+            return;
+        }
+
+        kernel_free_tensor(*self);
+        *self = Self::default();
+    }
+}
+
+struct KernelTensorAllocResult {
+    kernel_token: u64,
+    user_va: u64,
+    actual_size: u64,
+}
+
+fn kernel_alloc_tensor(_size_bytes: u64) -> KernelTensorAllocResult {
+    todo!("call StarryOS tensor allocator ioctl")
+}
+
+fn kernel_free_tensor(_desc: AiTensorDesc) {
+    // TODO: call StarryOS tensor allocator free ioctl.
+    todo!()
+}
+
+fn tensor_size_bytes(shape: &[u32], element_size: u32) -> u64 {
+    let element_count = shape.iter().fold(1_u64, |acc, dim| {
+        acc.checked_mul(*dim as u64)
+            .expect("tensor element count overflow")
+    });
+    element_count
+        .checked_mul(element_size as u64)
+        .expect("tensor byte size overflow")
 }
 
 /// 单个 lowered 算子的稳定描述。
-///
-/// 这个结构不直接进 SQ ring，而是作为 graph node 的主体放进 graph blob。
 /// 内核调度器按 `op` 解释 `attr_inline`，按 input/output count 解释 tensors。
 /// 对齐cacheline大小
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct AiKernelDesc {
-    /// 语义级 op。它不是 backend job，也不是最终硬件目标。
+    /// 语义级 op。
     pub op: KernelOp,
 
-    /// 用户态对目标的倾向。最终执行位置由调度器决定。
+    /// 用户态对目标的倾向(hint)。实际调度由调度器决定。
     pub target_hint: AiTargetHint,
 
     /// 输入 tensor 数量。输入必须放在 tensors 数组前部。
@@ -180,6 +244,7 @@ pub struct AiKernelDesc {
     pub output_count: u32,
 
     /// 输入和输出 tensor 描述数组。
+    /// 从[0..input_count)是输入tensor,[input_count..input_count+output_count)是输出tensor
     pub tensors: [AiTensorDesc; MAX_SUBMIT_TENSORS],
 
     /// 预留字段，保持后续 ABI 可扩展。
@@ -199,6 +264,7 @@ impl Default for AiKernelDesc {
         Self {
             op: KernelOp::INVALID,
             target_hint: AiTargetHint::AUTO,
+
             input_count: 0,
             output_count: 0,
             tensors: [AiTensorDesc::default(); MAX_SUBMIT_TENSORS],
@@ -210,11 +276,55 @@ impl Default for AiKernelDesc {
 }
 
 impl AiKernelDesc {
+    /// 通过 attr 类型自动构造单算子 desc。
+    ///
+    /// `attr` 的类型必须能唯一映射到一个 `KernelOp`，例如 `MatMulAttr` 会解析为
+    /// `KernelOp::MAT_MUL`。输入 tensor 必须放在 `tensors` 前部，输出 tensor 紧跟其后。
+    pub fn new<T: AiKernelAttr>(
+        attr: &T,
+        target_hint: AiTargetHint,
+        input_count: u32,
+        output_count: u32,
+        tensors: &[AiTensorDesc],
+    ) -> Self {
+        Self::new_with_op(T::OP, attr, target_hint, input_count, output_count, tensors)
+    }
+
+    /// 显式指定 op 构造 desc。
+    ///
+    /// ADD/MUL、SILU/SCALE 这类多个 op 共用同一个 attr 的算子走这个入口。
+    pub fn new_with_op<T: Copy>(
+        op: KernelOp,
+        attr: &T,
+        target_hint: AiTargetHint,
+        input_count: u32,
+        output_count: u32,
+        tensors: &[AiTensorDesc],
+    ) -> Self {
+        let total_count = input_count
+            .checked_add(output_count)
+            .expect("tensor count overflow");
+        let total_count = usize::try_from(total_count).expect("tensor count does not fit usize");
+
+        assert!(total_count <= MAX_SUBMIT_TENSORS);
+        assert!(tensors.len() == total_count);
+
+        let mut desc = Self {
+            op,
+            target_hint,
+            input_count,
+            output_count,
+            ..Self::default()
+        };
+        desc.tensors[..total_count].copy_from_slice(tensors);
+        desc.set_inline_attr(attr);
+        desc
+    }
+
     /// 写入内联 attr。
     ///
     /// 只应该传入本模块内定义的 `#[repr(C)] + Copy` attr 结构。
-    /// 这里会按字节复制，内核侧必须根据 op 和 attr_size 再做一次大小校验。
-    pub fn set_inline_attr<T: Copy>(&mut self, attr: &T) {
+    fn set_inline_attr<T: Copy>(&mut self, attr: &T) {
         let size = core::mem::size_of::<T>();
         assert!(size <= ATTR_INLINE_SIZE);
 
@@ -231,7 +341,7 @@ impl AiKernelDesc {
     }
 }
 
-/// 完成队列中的一条结果描述。
+/// AiGraphSubmitEntry对应的执行结果描述。
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Default)]
 pub struct AiCompletionEntry {
@@ -241,8 +351,8 @@ pub struct AiCompletionEntry {
     /// 0 表示成功；负数可以对齐内核 errno 风格错误码。
     pub status: i32,
 
-    /// 预留字段，保持结构体可扩展。
-    pub reserved0: u32,
+    /// 预留扩展字段。
+    pub reserved0: u8,
 }
 
 // ── 编译期大小/对齐断言 ──────────────────────────────────────
