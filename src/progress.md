@@ -8,7 +8,7 @@
 
 | 任务 | 目标 |
 |---|---|
-| [ ] 用户态 frontend 与 ring API | 完成用户态算子结构、最小 UAPI、ring entry 和 uring 用户 API（3 天） |
+| [*] 用户态 frontend 与 ring API | 完成用户态算子结构、最小 UAPI、ring entry 和 uring 用户 API（3 天） |
 | [ ] 纯线程内核执行路径 | 完成纯线程调度器、核心队列、worker、buffer pin/map/cache 最小路径（3 天） |
 | [ ] completion 回到用户态 | job/node/graph 完成后能通知用户态等待方（2 天） |
 | [ ] CPU fallback MatMul | 用 CPU fallback 跑通 MatMul 正确性（2 天） |
@@ -19,13 +19,13 @@
 
 ### 阶段一子任务拆分
 
-- [ ] 用户态 frontend 与 ring API（3 天）
+- [x] 用户态 frontend 与 ring API（3 天）
   - [x] 用户态 frontend 小 DAG、算子结构体与调用入口
-  - [ ] 用户态 backend 算子库骨架
   - [x] 最小 MatMul UAPI / submit struct / ring entry
-  - [ ] graph submit 到 ring
-  - [ ] uring 用户 API
+  - [x] graph submit 到 ring
+  - [x] uring 用户 API
 - [ ] 纯线程内核执行路径（3 天）
+  - [ ] 用户态 backend 算子库骨架
   - [ ] 纯线程内核调度器
   - [ ] 核心队列与 worker
   - [ ] buffer pin/map/cache 最小路径
