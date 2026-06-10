@@ -24,7 +24,8 @@ pub use graph::{
 };
 pub use kernel::{AiTargetHint, KernelOp};
 pub use kernelattr::{
-    BinaryAttr, Conv2dAttr, MatMulAttr, RmsNormAttr, RopeAttr, SoftmaxAttr, UnaryAttr,
+    AiKernelAttr, BinaryAttr, Conv2dAttr, MatMulAttr, RmsNormAttr, RopeAttr, SoftmaxAttr,
+    UnaryAttr,
 };
 
 // ── 常量 ──────────────────────────────────────────────────────

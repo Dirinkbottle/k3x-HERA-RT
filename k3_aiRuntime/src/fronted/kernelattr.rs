@@ -4,16 +4,23 @@
 //! 通过 `AiKernelDesc::set_inline_attr` 写入单算子描述的 `attr_inline` 区域。
 //! 所有 attr 结构必须在编译期断言为固定大小，方便内核侧做大小校验。
 
-use super::desc::AiDtype;
+use super::{desc::AiDtype, kernel::KernelOp};
 
-/// MatMul 算子参数。
+/// 能唯一映射到一个语义级 op 的算子 attr。
+///
+/// `AiKernelDesc::new` 通过这个 trait 从 attr 类型解析出 `KernelOp`。
+/// ADD/MUL、SILU/SCALE 这类复用同一个 attr 的算子不能实现这个 trait，
+/// 需要通过显式 op 构造入口创建 desc。
+pub trait AiKernelAttr: Copy {
+    const OP: KernelOp;
+}
+
+/// MatMul 最小算子参数。
 ///
 /// 张量约定：
 /// - tensors[0] = lhs
 /// - tensors[1] = rhs
 /// - tensors[2] = output
-///
-/// 第一阶段可以先支持 batch=1、无转置的基础路径。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct MatMulAttr {
@@ -133,6 +140,26 @@ pub struct Conv2dAttr {
     pub groups: u32,
     pub flags: u32,
     pub reserved: [u32; 15],
+}
+
+impl AiKernelAttr for MatMulAttr {
+    const OP: KernelOp = KernelOp::MAT_MUL;
+}
+
+impl AiKernelAttr for RmsNormAttr {
+    const OP: KernelOp = KernelOp::RMS_NORM;
+}
+
+impl AiKernelAttr for RopeAttr {
+    const OP: KernelOp = KernelOp::ROPE;
+}
+
+impl AiKernelAttr for SoftmaxAttr {
+    const OP: KernelOp = KernelOp::SOFTMAX;
+}
+
+impl AiKernelAttr for Conv2dAttr {
+    const OP: KernelOp = KernelOp::CONV2D;
 }
 
 // ── 编译期大小断言 ──────────────────────────────────────────────
