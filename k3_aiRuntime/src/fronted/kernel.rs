@@ -9,7 +9,7 @@
 /// ring 内容来自用户态，内核读取时可能遇到非法值；如果字段是 Rust enum，非法 discriminant
 /// 会带来未定义行为。`repr(transparent)` newtype 允许任意 u32，内核可以显式 validate。
 #[repr(transparent)]
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct KernelOp(pub u8);
 
 impl KernelOp {
@@ -34,7 +34,7 @@ impl KernelOp {
 /// 用户态给调度器的目标倾向。
 /// hint，最终执行位置由调度器决定。
 #[repr(transparent)]
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct AiTargetHint(pub u8);
 
 impl AiTargetHint {
