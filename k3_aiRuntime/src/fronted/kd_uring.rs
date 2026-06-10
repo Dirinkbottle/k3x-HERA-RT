@@ -8,14 +8,27 @@
 //! 这个地址就是我们可以给ovchannel的内存
 //! 在内核中各个进程的共享内存物理上为连续的,调度器可以直接从每片内存拿,效率较高
 
-//TODO:申请共享内存用来当做ring
-fn alloc_uring_memory() {}
+use crate::fronted::AiGraphSubmitEntry;
 
-//TODO:调用syscall.让任务开始调度
-fn kernel_schedule_bell() {
-    // 调用syscall
+
+pub struct UringChannel{
+    pub sender:ov_channels::Sender<'static>,
+    pub reciver:ov_channels::Receiver<'static>
 }
 
-//TODO:
-/// 提交图描述符到内核调度器
-pub fn submit_graph_to_scheduler() {}
+/// ovchannel sender获取,通过内核的ioctl来建立一对通道
+pub fn build_channel()->UringChannel{
+todo!()
+}
+
+// 发送一个AiGraphSubmitEntry到channel中,支持QUERY提交类型
+pub fn submit_graph(graph_entry:&AiGraphSubmitEntry){
+    // channel sender出去
+    todo!()
+}
+
+/// 从channel收集所有已经完成的任务,AiCompletionEntry
+pub fn wait_graph_complete(graph_entry:&AiGraphSubmitEntry){
+    // channel reciver接收AiCompletionEntry
+todo!()
+}
