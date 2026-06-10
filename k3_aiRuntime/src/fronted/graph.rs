@@ -1,19 +1,17 @@
 //! 算子计算图。
 //!
-//! SQ ring 里提交的是 `AiGraphSubmitEntry`，也就是 graph blob 的用户态地址和大小。
-//! graph blob 内部用 offset 组织节点和边，不在 UAPI 里保存 Rust 指针。
+//! channel里提交的是 `AiGraphSubmitEntry`
+//! graph blob 内部用 offset 组织节点和边。
 
 use core::mem;
+use bitflags::bitflags;
 
 use crate::fronted::{AI_ABI_VERSION, AiKernelDesc};
 
-/// graph blob 魔数，用于内核快速拒绝错误内存。
+/// graph blob 魔数
 pub const AI_GRAPH_MAGIC: u32 = 0x4845_5241; // "HERA"
 
 /// 提交类型。
-///
-/// 这里用 newtype 而不是 Rust enum。ring/UAPI 数据来自用户态，内核侧可能读到非法值；
-/// newtype 允许先读入，再显式校验，避免 enum 非法 discriminant 的 UB 风险。
 #[repr(transparent)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GraphSubmitKind(pub u32);
@@ -34,17 +32,15 @@ impl Default for GraphSubmitKind {
     }
 }
 
-/// 提交到 SQ ring 的 graph 入口。
-///
-/// 这个结构只描述“一整块 graph blob 在哪里”，不直接描述 MatMul/RMSNorm 等算子。
-/// 内核收到后应先 copy graph/control data，再解析 node/edge。
+/// 提交到 channel 的 graph 入口。
+/// 一次算子操作链任务的描述
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct AiGraphSubmitEntry {
     /// ABI 版本，必须等于 `AI_ABI_VERSION`。
     pub abi_version: u32,
 
-    /// 提交类型。阶段一主要使用 `GraphSubmitKind::GRAPH_SUBMIT`。
+    /// 提交类型。默认 `GraphSubmitKind::GRAPH_SUBMIT`。
     pub submit_kind: GraphSubmitKind,
 
     /// 提交 flags，阶段一先保留。
@@ -54,7 +50,7 @@ pub struct AiGraphSubmitEntry {
     pub reserved0: u32,
 
     /// 用户态 completion cookie。
-    /// 用户态用它匹配乱序完成的 graph。
+    /// 用户态用它匹配完成的 graph。
     pub user_token: u64,
 
     /// graph blob 的用户态虚拟地址。
@@ -133,9 +129,27 @@ pub struct AiGraphHeader {
 pub struct AiGraphNode {
     /// graph 内稳定节点编号。
     pub node_id: u32,
-
     /// 单个 lowered 算子的描述。
     pub desc: AiKernelDesc,
+    /// Graph节点的状态
+    pub state:AiGraphState
+}
+
+/// 表示某个图节点的执行状态
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AiGraphState{
+    complete:bool,
+    // bitflag 按位解释错误原因
+    error_flag:u8,
+}
+
+bitflags!{
+    pub struct GraphAiErrorFlags: u32 {
+        const A = 0b00000001;
+        const B = 0b00000010;
+        const C = 0b00000100;
+    }
 }
 
 /// graph 依赖边。
@@ -150,19 +164,18 @@ pub struct AiGraphEdge {
 
 /// 用户态构图时返回的依赖标识。
 ///
-/// 阶段一它等价于“当前链尾 node id”：继续向这条链追加算子时，
-/// 把这个 id 传给 `push_kernel_depend` 即可。
+/// 当前链尾 node id：继续向这条链追加算子时，
+/// 把这个 id 传给 `push_kernel_depend` 。
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct AiGraphNodeId(pub u32);
 
-/// 用户侧更直观的名字：一个 chain id 表示当前主图链的尾节点。
+/// 一个 chain id 表示当前主图链的尾节点。
 pub type AiGraphChainId = AiGraphNodeId;
 
 /// 用户态可持有的 frozen graph blob。
 ///
-/// 这个结构拥有一整块连续字节流，可以直接用 `as_bytes()` 做 mock 测试，
-/// 也可以用 `submit_entry()` 生成 SQ ring 里的提交信封。
+/// 一整块连续字节流，
 pub struct AiGraphBlob {
     bytes: Vec<u8>,
 }
@@ -226,10 +239,6 @@ impl AiGraphBlob {
 }
 
 /// 解析后的 graph。
-///
-/// parser 使用 `read_unaligned` 从字节流复制出结构体，不直接把 `&[u8]`
-/// 强转成结构体切片。这样即使用户态 blob 基地址没有满足 64 字节对齐，
-/// mock parser 也不会因为未对齐引用触发 UB。
 pub struct AiParsedGraph {
     pub header: AiGraphHeader,
     pub nodes: Vec<AiGraphNode>,
@@ -278,9 +287,6 @@ impl AiGraphParser {
 }
 
 /// 用户态 graph 管理器。
-///
-/// 第一阶段只维护 nodes/edges 两个数组。依赖关系是 DAG 的边，
-/// 不做链表，也不在节点里放指针。
 #[derive(Default)]
 pub struct GraphManager {
     nodes: Vec<AiGraphNode>,
@@ -313,7 +319,7 @@ impl GraphManager {
 
     /// 添加一个依赖多条链尾的算子。
     ///
-    /// 例如 `a -> b, c -> b` 可以写成 `push_kernel_depend_many(&[a, c], b_desc)`。
+    /// 例如 `a -> b, c -> b` 可写成 `push_kernel_depend_many(&[a, c], b_desc)`。
     pub fn push_kernel_depend_many(
         &mut self,
         depends: &[AiGraphChainId],
@@ -345,7 +351,7 @@ impl GraphManager {
     fn push_node(&mut self, desc: AiKernelDesc) -> Result<AiGraphChainId, AiGraphBuildError> {
         let node_id =
             u32::try_from(self.nodes.len()).map_err(|_| AiGraphBuildError::TooManyNodes)?;
-        self.nodes.push(AiGraphNode { node_id, desc });
+        self.nodes.push(AiGraphNode { node_id, desc,state:AiGraphState::default()});
         Ok(AiGraphNodeId(node_id))
     }
 
