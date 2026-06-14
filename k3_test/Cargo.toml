@@ -1,0 +1,13 @@
+[package]
+name = "k3_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+k3_aiRuntime = { path = "../k3_aiRuntime" }
+
+[profile.dev]
+debug = true
+
+[profile.release]
+debug = true

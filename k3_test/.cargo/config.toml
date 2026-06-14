@@ -1,0 +1,10 @@
+[build]
+target = "riscv64gc-unknown-linux-musl"
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "/home/inkbottle/.local/riscv-musl/bin/riscv64-unknown-linux-musl-gcc"
+ar = "/home/inkbottle/.local/riscv-musl/bin/riscv64-unknown-linux-musl-ar"
+rustflags = [
+    "-C",
+    "target-feature=+crt-static",
+]
