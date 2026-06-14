@@ -1,8 +1,9 @@
 //! 提交给内核的 tensor 描述、单算子描述和 completion entry。
 //!
-//! 这些结构只描述用户态 buffer，不拥有内存。
-//! 内核收到 graph 后必须校验 `user_va..user_va+size_bytes` 是否有效，
-//! 并在执行期间 pin 住相关页帧，不能相信"用户态库保证有效"。
+//! 当前阶段 tensor 数据直接放在用户态虚拟地址空间。
+//! `AiTensorDesc` 只描述这块用户态 buffer 的形状、布局和地址，本身不拥有内存。
+//! 内核或 guard 程序收到 graph 后必须重新校验 `user_va..user_va+size_bytes`，
+//! 不能把用户态 desc 当成可信对象直接使用。
 
 use super::kernel::{AiTargetHint, KernelOp};
 use super::kernelattr::AiKernelAttr;
@@ -88,13 +89,10 @@ pub struct AiQuantDesc {
 /// 提交给内核的 tensor 描述。
 ///
 /// 这个结构只描述用户态 buffer，不拥有内存。
-/// 目前由内核驱动分配连续的物理页帧
+/// tensor 的实际生命周期由用户态 `Tensor` / `TensorManager` 管理。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AiTensorDesc {
-    /// 由内核驱动分配的内存凭证token
-    pub kernel_token:u64,
-
     /// 用户态虚拟地址。
     pub user_va: u64,
 
@@ -117,7 +115,7 @@ pub struct AiTensorDesc {
     /// TODO:
     pub flags: u8,
 
-    /// 预留字段，保持 8 字节对齐，ABI 扩展留空间。
+    /// 预留字段，ABI 扩展留空间。
     pub reserved0: u32,
 
     /// 每个维度的元素数量。
@@ -131,91 +129,53 @@ pub struct AiTensorDesc {
 }
 
 impl AiTensorDesc {
-    /// 从内核 allocator 返回的信息构造 tensor 描述。
+    /// 从一块已有的用户态 buffer 构造 tensor 描述。
     ///
-    /// 由用户态 tensor allocator 包装层调用。真实 tensor 空间由内核
-    /// allocator 分配，`kernel_token` 是后续 submit/bind/free 的可信身份。
-    pub(crate) fn from_kernel_alloc(
-        kernel_token: u64,
+    /// 这里不分配内存，只把用户态地址、shape、dtype 等语义收敛成稳定 ABI。
+    pub fn from_user_buffer(
         user_va: u64,
         size_bytes: u64,
         dtype: AiDtype,
         format: AiTensorFormat,
         layout: AiTensorLayout,
         shape: &[u32],
-        _flags:u8
+        flags: u8,
     ) -> Self {
         assert!(shape.len() <= MAX_DIM);
 
+        let element_size = dtype
+            .element_size_bytes()
+            .expect("quantized or unknown dtype needs explicit size path");
+        let required_size = tensor_size_bytes(shape, element_size);
+        assert!(size_bytes >= required_size);
+
         let mut desc = Self {
-            kernel_token,
             user_va,
             size_bytes,
             dtype,
             format,
             layout,
             ndim: shape.len() as u32,
-            flags: _flags,
+            flags,
             ..Self::default()
         };
 
         desc.shape[..shape.len()].copy_from_slice(shape);
+        if !shape.is_empty() {
+            let mut stride = element_size as u64;
+            for dim_idx in (0..shape.len()).rev() {
+                desc.stride_bytes[dim_idx] = stride;
+                stride = stride
+                    .checked_mul(shape[dim_idx] as u64)
+                    .expect("tensor stride overflow");
+            }
+        }
         desc
     }
-
-    /// 调用内核 allocator 分配 tensor desc 和实际 tensor 空间。
-    pub(crate) fn alloc_from_kernel(
-        dtype: AiDtype,
-        format: AiTensorFormat,
-        layout: AiTensorLayout,
-        shape: &[u32],
-        flags: u8,
-    ) -> Self {
-        let element_size = dtype
-            .element_size_bytes()
-            .expect("quantized or unknown dtype needs explicit allocator path");
-        let size_bytes = tensor_size_bytes(shape, element_size);
-
-        let alloc = kernel_alloc_tensor(size_bytes);
-        Self::from_kernel_alloc(
-            alloc.kernel_token,
-            alloc.user_va,
-            alloc.actual_size,
-            dtype,
-            format,
-            layout,
-            shape,
-            flags,
-        )
-    }
-
-    /// 释放由内核 allocator 分配的 tensor。
-    pub(crate) fn free(&mut self) {
-        if self.kernel_token == 0 {
-            return;
-        }
-
-        kernel_free_tensor(*self);
-        *self = Self::default();
-    }
 }
 
-struct KernelTensorAllocResult {
-    kernel_token: u64,
-    user_va: u64,
-    actual_size: u64,
-}
-
-fn kernel_alloc_tensor(_size_bytes: u64) -> KernelTensorAllocResult {
-    todo!("call StarryOS tensor allocator ioctl")
-}
-
-fn kernel_free_tensor(_desc: AiTensorDesc) {
-    // TODO: call StarryOS tensor allocator free ioctl.
-    todo!()
-}
-
-fn tensor_size_bytes(shape: &[u32], element_size: u32) -> u64 {
+/// 计算 tensor 数据总字节数：各维度元素数之积 × 单元素字节数。
+pub(crate) fn tensor_size_bytes(shape: &[u32], element_size: u32) -> u64 {
     let element_count = shape.iter().fold(1_u64, |acc, dim| {
         acc.checked_mul(*dim as u64)
             .expect("tensor element count overflow")

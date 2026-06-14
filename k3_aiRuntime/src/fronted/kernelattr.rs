@@ -52,9 +52,6 @@ pub struct RmsNormAttr {
 }
 
 /// RoPE 算子参数。
-///
-/// 参数名尽量贴近 ggml rope 的语义，但第一阶段 backend 可以只实现最小子集。
-/// 未支持字段必须要求用户态填默认值，而不是让 backend 猜。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct RopeAttr {

@@ -1,15 +1,14 @@
 //! 用户态 frontend 的稳定提交描述。
 //!
-//! 这一层只描述"用户想执行什么算子、输入输出张量在哪里、算子参数是什么"。
-//! 它不保存 Rust 对象指针、不保存 backend 函数指针，也不决定最终跑在 CPU/X100/A100。
-//! 这些结构后续会被复制到 ring entry 里，再由内核调度器校验、pin buffer、选择 backend。
+//! 描述用户态算子提交所需的 tensor 描述、算子参数和 graph 结构。
+//! 这些结构会被复制到 ring entry 里，由内核调度器校验、pin buffer、选择 backend。
 
 pub mod desc;
 pub mod graph;
 pub mod kd_uring;
 pub mod kernel;
 pub mod kernelattr;
-pub mod tensor;
+pub mod tensormanager;
 
 // ── 子模块 re-export ──────────────────────────────────────────
 
@@ -27,6 +26,7 @@ pub use kernelattr::{
     AiKernelAttr, BinaryAttr, Conv2dAttr, MatMulAttr, RmsNormAttr, RopeAttr, SoftmaxAttr,
     UnaryAttr,
 };
+pub use tensormanager::{Tensor, TensorManager};
 
 // ── 常量 ──────────────────────────────────────────────────────
 

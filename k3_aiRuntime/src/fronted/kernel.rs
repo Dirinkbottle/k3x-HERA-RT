@@ -1,13 +1,7 @@
 //! ring 中的算子编号与目标倾向。
-//!
-//! `KernelOp` 和 `AiTargetHint` 都是 `repr(transparent)` newtype，
-//! 允许任意 u32 值通过，内核侧根据 `is_known()` 做显式校验，
-//! 避免 Rust enum 非法 discriminant 带来的未定义行为。
+
 
 /// ring 中的算子编号。
-///
-/// ring 内容来自用户态，内核读取时可能遇到非法值；如果字段是 Rust enum，非法 discriminant
-/// 会带来未定义行为。`repr(transparent)` newtype 允许任意 u32，内核可以显式 validate。
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct KernelOp(pub u8);
