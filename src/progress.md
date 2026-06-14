@@ -25,10 +25,10 @@
   - [x] graph submit 到 ring
   - [x] uring 用户 API
 - [ ] 纯线程内核执行路径（3 天）
-  - [ ] 用户态 backend 算子库骨架
+  - [x] 用户态 backend 算子库骨架
   - [ ] 纯线程内核调度器
   - [ ] 核心队列与 worker
-  - [ ] buffer pin/map/cache 最小路径
+  - [x] buffer pin/map/cache 最小路径
 - [ ] completion 回到用户态（2 天）
   - [ ] completion ring entry
   - [ ] token 匹配与错误码返回
