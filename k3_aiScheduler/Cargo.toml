@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 dma-api = "0.8.1"
 ov-channels = { version = "0.2" }
+k3_aiUabi = { path = "../k3_aiUabi" }
+k3_kernel_backend = { path = "../k3_kernel_backend" }
+log = "0.4.32"

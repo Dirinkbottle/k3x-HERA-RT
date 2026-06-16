@@ -110,3 +110,248 @@
 //! 本次 graph bind 住的 tensor ref。用户态看到 completion 后才允许安全复用或 free
 //! 相关 tensor。
 
+
+use alloc::{collections::vec_deque::VecDeque, vec::Vec};
+use alloc::vec;
+use k3_aiUabi::{AiGraphNode, AiParsedGraph};
+
+/// 内核侧把一张 DAG 收敛成的单条调度链。
+///
+/// 阶段一先把图按稳定拓扑序解析成一条直链。真正执行时仍然以 edge 语义为准，
+/// 这里只负责给调度器一个”当前可接受”的线性顺序。
+#[derive(Clone)]
+pub struct TaskLink {
+    /// 提交该 graph 的进程。
+    pub pid: u32,
+    /// 链头 node id。空图时为 `None`。
+    pub head_node: Option<u32>,
+    /// 链尾 node id。空图时为 `None`。
+    pub tail_node: Option<u32>,
+    /// `next_node[node_id]` 表示当前直链里下一个节点是谁。
+    pub next_node: Vec<Option<u32>>,
+    /// 解析出的稳定拓扑序。
+    pub node_order: Vec<u32>,
+    /// 直链对应的节点副本，顺序与 `node_order` 一致。
+    pub ordered_nodes: Vec<AiGraphNode>,
+}
+
+impl TaskLink {
+    pub fn iter(&self) -> impl Iterator<Item = &AiGraphNode> {
+        self.ordered_nodes.iter()
+    }
+
+    pub fn pop_front(&mut self) -> Option<AiGraphNode> {
+        if self.ordered_nodes.is_empty() {
+            None
+        } else {
+            Some(self.ordered_nodes.remove(0))
+        }
+    }
+}
+
+/// graph 解析失败。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ResolveGraphError {
+    BadNodeId(u32),
+    BadEdge { from_node: u32, to_node: u32 },
+    CycleDetected,
+}
+
+
+
+
+/// 根据 edge 关系把一张解析后的 graph 收成可调度的直链。
+///
+/// 阶段一先做稳定拓扑排序：
+/// - 所有入度为 0 的节点先进入 ready 队列；
+/// - ready 队列按 node id 的自然顺序出队；
+/// - 节点完成后减少后继入度，新的 ready 节点再入队。
+///
+/// 这样 `a -> b, c -> b` 会解析成 `a -> c -> b` 或其他满足 edge 约束的稳定顺序。
+pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink, ResolveGraphError> {
+    let node_count = graph.nodes.len();
+    let mut indegree = vec![0_usize; node_count];
+    let mut outgoing = vec![Vec::new(); node_count];
+
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if node.node_id != idx as u32 {
+            return Err(ResolveGraphError::BadNodeId(node.node_id));
+        }
+    }
+
+    for edge in &graph.edges {
+        let from = edge.from_node as usize;
+        let to = edge.to_node as usize;
+        if from >= node_count || to >= node_count {
+            return Err(ResolveGraphError::BadEdge {
+                from_node: edge.from_node,
+                to_node: edge.to_node,
+            });
+        }
+
+        outgoing[from].push(edge.to_node);
+        indegree[to] += 1;
+    }
+
+    let mut ready = VecDeque::new();
+    for (idx, degree) in indegree.iter().enumerate() {
+        if *degree == 0 {
+            ready.push_back(idx as u32);
+        }
+    }
+
+    let mut node_order = Vec::with_capacity(node_count);
+    while let Some(node_id) = ready.pop_front() {
+        node_order.push(node_id);
+
+        for &next_node in &outgoing[node_id as usize] {
+            let next_idx = next_node as usize;
+            indegree[next_idx] -= 1;
+            if indegree[next_idx] == 0 {
+                ready.push_back(next_node);
+            }
+        }
+    }
+
+    if node_order.len() != node_count {
+        return Err(ResolveGraphError::CycleDetected);
+    }
+
+    let mut next_node = vec![None; node_count];
+    for window in node_order.windows(2) {
+        next_node[window[0] as usize] = Some(window[1]);
+    }
+
+    let mut ordered_nodes = Vec::with_capacity(node_count);
+    for &node_id in &node_order {
+        ordered_nodes.push(graph.nodes[node_id as usize]);
+    }
+
+    Ok(TaskLink {
+        pid,
+        head_node: node_order.first().copied(),
+        tail_node: node_order.last().copied(),
+        next_node,
+        node_order,
+        ordered_nodes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use k3_aiUabi::{
+        AiGraphBuildError, AiGraphEdge, AiGraphParser, AiKernelDesc, GraphManager,
+    };
+
+    use super::*;
+
+    fn build_graph<F>(f: F) -> AiParsedGraph
+    where
+        F: FnOnce(&mut GraphManager) -> Result<(), AiGraphBuildError>,
+    {
+        let mut graph = GraphManager::new();
+        f(&mut graph).expect("graph build should succeed");
+        let blob = graph.freeze().expect("graph freeze should succeed");
+        AiGraphParser::parse(blob.as_bytes()).expect("graph parse should succeed")
+    }
+
+    #[test]
+    fn resolve_chain_keeps_edge_order() {
+        let parsed = build_graph(|graph| {
+            let a = graph.push_kernel_no_depend(AiKernelDesc::default())?;
+            let b = graph.push_kernel_depend(a, AiKernelDesc::default())?;
+            let _c = graph.push_kernel_depend(b, AiKernelDesc::default())?;
+            Ok(())
+        });
+
+        let link = resolve_parsed_graph(7, &parsed).expect("resolve graph should succeed");
+
+        assert_eq!(link.pid, 7);
+        assert_eq!(link.node_order, vec![0, 1, 2]);
+        assert_eq!(link.head_node, Some(0));
+        assert_eq!(link.tail_node, Some(2));
+        assert_eq!(link.next_node[0], Some(1));
+        assert_eq!(link.next_node[1], Some(2));
+        assert_eq!(link.next_node[2], None);
+    }
+
+    #[test]
+    fn resolve_join_and_fork_respects_dependencies() {
+        let parsed = build_graph(|graph| {
+            let a = graph.push_kernel_no_depend(AiKernelDesc::default())?;
+            let c = graph.push_kernel_no_depend(AiKernelDesc::default())?;
+            let b = graph.push_kernel_depend_many(&[a, c], AiKernelDesc::default())?;
+            let _d = graph.push_kernel_depend(b, AiKernelDesc::default())?;
+            let _e = graph.push_kernel_depend(b, AiKernelDesc::default())?;
+            Ok(())
+        });
+
+        let link = resolve_parsed_graph(9, &parsed).expect("resolve graph should succeed");
+
+        assert_eq!(link.head_node, Some(link.node_order[0]));
+        assert_eq!(link.tail_node, Some(*link.node_order.last().unwrap()));
+        assert_eq!(link.ordered_nodes.len(), parsed.nodes.len());
+
+        for edge in &parsed.edges {
+            let from_pos = link
+                .node_order
+                .iter()
+                .position(|node_id| *node_id == edge.from_node)
+                .expect("from node should exist in order");
+            let to_pos = link
+                .node_order
+                .iter()
+                .position(|node_id| *node_id == edge.to_node)
+                .expect("to node should exist in order");
+            assert!(
+                from_pos < to_pos,
+                "edge {} -> {} violated by {:?}",
+                edge.from_node,
+                edge.to_node,
+                link.node_order
+            );
+        }
+    }
+
+    #[test]
+    fn reject_out_of_range_edge() {
+        let mut parsed = build_graph(|graph| {
+            graph.push_kernel_no_depend(AiKernelDesc::default())?;
+            Ok(())
+        });
+        parsed.edges.push(AiGraphEdge {
+            from_node: 0,
+            to_node: 3,
+        });
+
+        match resolve_parsed_graph(1, &parsed) {
+            Err(err) => assert_eq!(
+                err,
+                ResolveGraphError::BadEdge {
+                    from_node: 0,
+                    to_node: 3,
+                }
+            ),
+            Ok(_) => panic!("resolve_graph should reject out-of-range edge"),
+        }
+    }
+
+    #[test]
+    fn reject_cycle_by_edges() {
+        let mut parsed = build_graph(|graph| {
+            let a = graph.push_kernel_no_depend(AiKernelDesc::default())?;
+            let b = graph.push_kernel_depend(a, AiKernelDesc::default())?;
+            let _c = graph.push_kernel_depend(b, AiKernelDesc::default())?;
+            Ok(())
+        });
+        parsed.edges.push(AiGraphEdge {
+            from_node: 2,
+            to_node: 0,
+        });
+
+        match resolve_parsed_graph(2, &parsed) {
+            Err(err) => assert_eq!(err, ResolveGraphError::CycleDetected),
+            Ok(_) => panic!("resolve_graph should reject cycle graph"),
+        }
+    }
+}
