@@ -9,7 +9,10 @@ use std::{
     fs::{File, OpenOptions},
     io,
     mem::size_of,
-    os::{fd::AsRawFd, raw::{c_int, c_ulong, c_void}},
+    os::{
+        fd::AsRawFd,
+        raw::{c_int, c_ulong, c_void},
+    },
     ptr,
     sync::{Arc, Mutex},
 };
@@ -17,7 +20,7 @@ use std::{
 use lazy_static::lazy_static;
 use ov_channels::{ChannelId, Message, SharedMemory};
 
-use crate::fronted::AiGraphSubmitEntry;
+use crate::fronted::{AI_ABI_VERSION, AiGraphSubmitEntry};
 
 pub const K3_AI_IOC_BUILD_CHANNEL: u32 = 0x4B33_0001;
 pub const K3_AI_IOC_SUBMIT_GRAPH: u32 = 0x4B33_0002;
@@ -76,9 +79,9 @@ const MAP_ANONYMOUS: c_int = 0x20;
 const MAP_FAILED: *mut c_void = !0 as *mut c_void;
 
 // 持有 mmap 映射，Drop 时自动 munmap。
-struct MmapMemory {
-    ptr: *mut u8,
-    len: usize,
+pub(crate) struct MmapMemory {
+    pub(crate) ptr: *mut u8,
+    pub(crate) len: usize,
 }
 
 unsafe impl Send for MmapMemory {}
@@ -92,6 +95,49 @@ impl Drop for MmapMemory {
     }
 }
 
+impl MmapMemory {
+    /// 建立一段 MAP_SHARED anonymous 内存，供 channel/tensor 交给内核保活和映射。
+    pub(crate) fn new_shared(len: usize) -> io::Result<Self> {
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mmap length is zero",
+            ));
+        }
+
+        let ptr = unsafe {
+            mmap(
+                ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            ptr: ptr.cast::<u8>(),
+            len,
+        })
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr.cast_const()
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
 /// 打开 `/dev/k3_airunner`，mmap 共享内存并通过 `BUILD_CHANNEL` ioctl 让内核保活。
 pub fn build_channel() -> io::Result<UringChannel> {
     let dev = OpenOptions::new()
@@ -100,19 +146,8 @@ pub fn build_channel() -> io::Result<UringChannel> {
         .open("/dev/k3_airunner")?;
 
     let shared_size = size_of::<SharedMemory<K3_CHANNEL_COUNT>>();
-    let shared_ptr = unsafe {
-        mmap(
-            ptr::null_mut(),
-            shared_size,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if shared_ptr == MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
+    let mut memory = MmapMemory::new_shared(shared_size)?;
+    let shared_ptr = memory.as_mut_ptr().cast::<c_void>();
 
     // 这块共享区后面会被 ov-channels 当成固定布局的协议区使用，
     // 所以在用户态先原地初始化。
@@ -138,10 +173,7 @@ pub fn build_channel() -> io::Result<UringChannel> {
         return Err(io::Error::last_os_error());
     }
 
-    let memory = Arc::new(MmapMemory {
-        ptr: shared_ptr.cast::<u8>(),
-        len: shared_size,
-    });
+    let memory = Arc::new(memory);
 
     let shared = ChannelMemory {
         user_va: shared_ptr as usize,
@@ -150,23 +182,51 @@ pub fn build_channel() -> io::Result<UringChannel> {
     };
 
     {
-        let mut slot = CHANNEL_MEMORY.lock().expect("channel memory mutex poisoned");
+        let mut slot = CHANNEL_MEMORY
+            .lock()
+            .expect("channel memory mutex poisoned");
         *slot = Some(memory);
     }
 
     Ok(UringChannel { dev, shared })
 }
 
+/// 用户接口
 /// 提交 graph 描述。当前仍然只通过 ioctl 把 `AiGraphSubmitEntry` 指针传给内核。
 pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) -> io::Result<()> {
     let va = channel.shared.user_va;
 
-    // 检查channel内存初始化
+    if va == 0
+        || channel.shared.size_bytes == 0
+        || channel.shared._memory.len == 0
+        || channel.shared._memory.ptr.is_null()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid channel: va or size is zero",
+        ));
+    }
+
+    if graph_entry.abi_version != AI_ABI_VERSION {
+        // ABI错误
+    }
 
     // 建立channel,发entry
     let shm = unsafe { ov_channels::SharedMemory::<K3_CHANNEL_COUNT>::at(va) };
-    let sender_channel_0 = shm.sender(ChannelId::new(0)).expect("build fail");
-    sender_channel_0.try_send(&Message::notification(1));
+    let sender_channel_0 = shm
+        .sender(ChannelId::new(0))
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to get sender channel"))?;
+
+    // 序列化entry,发entry
+    let data = graph_entry.to_le_byte();
+    sender_channel_0
+        .try_send(&Message::data(data.unwrap()))
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "failed to send graph entry to channel",
+            )
+        })?;
 
     let ret = unsafe {
         ioctl(

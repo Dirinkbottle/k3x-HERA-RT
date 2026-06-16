@@ -22,7 +22,9 @@ fn build_matmul_kernel_desc() {
     let tensors = [lhs.desc(), rhs.desc(), output.desc()];
     let matmul_desc = AiKernelDesc::new(&matmul_attr, AiTargetHint::AUTO, 2, 1, &tensors);
     let mut graph = GraphManager::new();
-    graph.push_kernel_no_depend(matmul_desc).expect("matmul kernel graph build error");
+    graph
+        .push_kernel_no_depend(matmul_desc)
+        .expect("matmul kernel graph build error");
     let submit_blob = graph.freeze().expect("matmul kernel graph build error");
     let submit_entry = submit_blob.submit_entry(2);
 

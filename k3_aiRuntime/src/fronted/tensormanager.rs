@@ -3,16 +3,15 @@
 //! 当前阶段 tensor 数据直接放在用户态。
 //! `TensorManager` 负责分配一块稳定的用户态 buffer，并生成配套 `AiTensorDesc`。
 
-use super::{
-    desc::tensor_size_bytes, AiDtype, AiTensorDesc, AiTensorFormat, AiTensorLayout,
-};
+use super::kd_uring::MmapMemory;
+use k3_aiUabi::{AiDtype, AiTensorDesc, AiTensorFormat, AiTensorLayout, tensor_size_bytes};
 
 /// 用户态 tensor 句柄。
 ///
-/// `storage` 真正持有内存，`desc.user_va` 只是把这块内存暴露给 graph / kernel ABI。
+/// `storage` 是 MAP_SHARED mmap 内存，`desc.user_va` 把这块内存暴露给 graph/kernel ABI。
 pub struct Tensor {
     desc: AiTensorDesc,
-    storage: Vec<u8>,
+    storage: MmapMemory,
 }
 
 impl Tensor {
@@ -43,14 +42,14 @@ impl Tensor {
 
     /// 原始字节只读视图。
     pub fn as_slice(&self) -> &[u8] {
-        &self.storage
+        unsafe { core::slice::from_raw_parts(self.storage.as_ptr(), self.storage.len()) }
     }
 
     /// 原始字节可写视图。
     ///
-    /// 只要 `storage` 不发生重新分配，`desc.user_va` 就一直稳定。
+    /// mmap 生命周期由 `Tensor` 持有，`desc.user_va` 在 drop 前保持稳定。
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.storage
+        unsafe { core::slice::from_raw_parts_mut(self.storage.as_mut_ptr(), self.storage.len()) }
     }
 
     /// F32 只读视图。
@@ -94,13 +93,7 @@ impl TensorManager {
 
     /// 用默认 format/layout 分配一个 dense tensor。
     pub fn alloc_tensor(&self, dtype: AiDtype, shape: &[u32]) -> Tensor {
-        self.alloc_tensor_with_layout(
-            dtype,
-            AiTensorFormat::ANY,
-            AiTensorLayout::DENSE,
-            shape,
-            0,
-        )
+        self.alloc_tensor_with_layout(dtype, AiTensorFormat::ANY, AiTensorLayout::DENSE, shape, 0)
     }
 
     /// 按指定格式和布局分配用户态 tensor。
@@ -118,8 +111,8 @@ impl TensorManager {
         let size_bytes = tensor_size_bytes(shape, element_size);
         let size_bytes = usize::try_from(size_bytes).expect("tensor size does not fit usize");
 
-        // 先把容量一次性建好，避免后面 push 导致底层地址漂移。
-        let mut storage = vec![0_u8; size_bytes];
+        // Tensor 数据必须是 shared mmap，这样 StarryOS 内核能抓 SharedPages 保活。
+        let mut storage = MmapMemory::new_shared(size_bytes).expect("failed to mmap tensor");
         let desc = AiTensorDesc::from_user_buffer(
             storage.as_mut_ptr() as u64,
             storage.len() as u64,
