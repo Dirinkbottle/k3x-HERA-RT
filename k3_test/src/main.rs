@@ -3,7 +3,10 @@
 use core::ptr;
 use std::os::raw::{c_int, c_void};
 
-use k3_aiRuntime::fronted::kd_uring::build_channel;
+use k3_aiRuntime::fronted::{
+    AiDtype, AiKernelDesc, AiTargetHint, GraphManager, MatMulAttr, TensorManager,
+    kd_uring::{build_channel, submit_graph}
+};
 
 unsafe extern "C" {
     fn mmap(
@@ -14,6 +17,7 @@ unsafe extern "C" {
         fd: c_int,
         offset: isize,
     ) -> *mut c_void;
+    fn munmap(addr: *mut c_void, length: usize) -> c_int;
 }
 
 // ── mmap 常量（来自 Linux asm-generic/mman.h）──────────────────
@@ -21,60 +25,79 @@ const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
 const MAP_ANONYMOUS: c_int = 0x20;
-const MAP_FIXED_NOREPLACE: c_int = 0x100000; // 不覆盖已有映射，冲突时返回 EEXIST
 const MAP_FAILED: *mut c_void = !0 as *mut c_void;
 
 fn main() {
     let channel = build_channel().expect("failed to build /dev/k3_airunner channel");
-    let channel_va = channel.shared.user_va;
-    let channel_size = channel.shared.size_bytes;
 
-    println!(
-        "k3_test: channel built, va={:#x}, size={:#x}",
-        channel_va, channel_size
-    );
+    println!("k3_test: channel built, va={:#x}, size={:#x}",
+        channel.shared.user_va, channel.shared.size_bytes);
 
-    // 直接往 channel 共享区写入一段标记字符串，后面拿它验证这块共享区有没有保住。
-    unsafe {
-        let bytes = b"ovchannel";
-        ptr::copy_nonoverlapping(bytes.as_ptr(), channel_va as *mut u8, bytes.len());
-    }
-    println!("k3_test: wrote marker string into shared channel memory");
+    let tensor_mgr = TensorManager::new();
+    let mut graph = GraphManager::new();
 
-    // 显式 drop 用户态 channel 句柄。
-    // 这一步之后，这段共享区如果还能读出来，就说明 runtime 全局持有路径生效了。
-    drop(channel);
-    println!("k3_test: dropped user-facing UringChannel handle");
+    // matmul: 2×3 @ 3×5 = 2×5
+    let mut lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
+    let mut rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[3, 5]);
+    let out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 5]);
 
-    // 先直接从原地址读回，验证 drop 用户态句柄后，这段共享区仍然活着。
-    let mut readback = [0_u8; 9];
-    unsafe {
-        ptr::copy_nonoverlapping(channel_va as *const u8, readback.as_mut_ptr(), readback.len());
-    }
-    let text = core::str::from_utf8(&readback).expect("shared memory marker is not utf8");
-    println!("k3_test: readback after drop=\"{}\"", text);
-    assert_eq!(text, "ovchannel");
+    // 填充 lhs 数据: [[1, 2, 3], [4, 5, 6]]
+    let lhs_data = lhs.as_f32_mut_slice();
+    lhs_data[0] = 1.0; lhs_data[1] = 2.0; lhs_data[2] = 3.0;
+    lhs_data[3] = 4.0; lhs_data[4] = 5.0; lhs_data[5] = 6.0;
 
-    // 再尝试把同一段虚拟地址重新 mmap 一次。
-    // 这里不能用 MAP_FIXED；MAP_FIXED 成功会直接顶掉旧映射，测出来的就不是原内容了。
-    // 用 MAP_FIXED_NOREPLACE 才能判断这一地址范围是否依然被原映射占着。
-    let remap_ptr = unsafe {
-        mmap(
-            channel_va as *mut c_void,
-            channel_size,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-            -1,
-            0,
-        )
+    // 填充 rhs 数据: [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 1, 0, 0]]
+    let rhs_data = rhs.as_f32_mut_slice();
+    for i in 0..15 { rhs_data[i] = 0.0; }
+    rhs_data[0] = 1.0; rhs_data[6] = 1.0; rhs_data[12] = 1.0;
+
+    let matmul_attr = MatMulAttr {
+        m: 2,
+        n: 5,
+        k: 3,
+        batch: 0,
+        lhs_row_stride: 3,
+        lhs_col_stride: 1,
+        lhs_batch_stride: 0,
+        rhs_row_stride: 5,
+        rhs_col_stride: 1,
+        rhs_batch_stride: 0,
+        out_row_stride: 5,
+        out_col_stride: 1,
+        out_batch_stride: 0,
+        flags: 0,
+        accum_dtype: AiDtype::F32,
+        reserved: [0; 3],
     };
 
-    if remap_ptr == MAP_FAILED {
-        println!("k3_test: MAP_FIXED_NOREPLACE failed as expected, original mapping is still occupying the same va range");
-    } else {
-        panic!(
-            "k3_test: unexpected remap success at {:#x}, channel mapping was not kept alive",
-            remap_ptr as usize
-        );
+    let matmul_desc = AiKernelDesc::new(
+        &matmul_attr, AiTargetHint::AUTO, 2, 1,
+        &[lhs.desc(), rhs.desc(), out.desc()]
+    );
+    let _node = graph.push_kernel_no_depend(matmul_desc).expect("failed to push matmul");
+
+    // 冻结并提交
+    let blob = graph.freeze().expect("failed to freeze graph");
+    let entry = blob.submit_entry(0);
+
+    println!("k3_test: submitting 2×5 matmul");
+    submit_graph(&channel, &entry).expect("failed to submit graph");
+    println!("k3_test: graph submitted successfully");
+
+    // 打印结果
+    let result = out.as_f32_slice();
+    println!("result (2×5):");
+    for i in 0..2 {
+        print!("  [");
+        for j in 0..5 {
+            print!("{:6.1}", result[i * 5 + j]);
+        }
+        println!(" ]");
+    }
+
+
+    println!("continue , current avoid kernel access user addr");
+    loop {
+        
     }
 }
