@@ -5,6 +5,7 @@
 
 use super::kd_uring::MmapMemory;
 use k3_aiUabi::{AiDtype, AiTensorDesc, AiTensorFormat, AiTensorLayout, tensor_size_bytes};
+use k3_aiUabi::error::AiRuntimeErr;
 
 /// 用户态 tensor 句柄。
 ///
@@ -92,7 +93,7 @@ impl TensorManager {
     }
 
     /// 用默认 format/layout 分配一个 dense tensor。
-    pub fn alloc_tensor(&self, dtype: AiDtype, shape: &[u32]) -> Tensor {
+    pub fn alloc_tensor(&self, dtype: AiDtype, shape: &[u32]) -> Result<Tensor, AiRuntimeErr> {
         self.alloc_tensor_with_layout(dtype, AiTensorFormat::ANY, AiTensorLayout::DENSE, shape, 0)
     }
 
@@ -104,15 +105,14 @@ impl TensorManager {
         layout: AiTensorLayout,
         shape: &[u32],
         flags: u8,
-    ) -> Tensor {
+    ) -> Result<Tensor, AiRuntimeErr> {
         let element_size = dtype
             .element_size_bytes()
-            .expect("quantized or unknown dtype needs explicit tensor manager path");
+            .ok_or(AiRuntimeErr::InvalidInput)?;
         let size_bytes = tensor_size_bytes(shape, element_size);
-        let size_bytes = usize::try_from(size_bytes).expect("tensor size does not fit usize");
+        let size_bytes = usize::try_from(size_bytes).map_err(|_| AiRuntimeErr::InvalidShape)?;
 
-        // Tensor 数据必须是 shared mmap，这样 StarryOS 内核能抓 SharedPages 保活。
-        let mut storage = MmapMemory::new_shared(size_bytes).expect("failed to mmap tensor");
+        let mut storage = MmapMemory::new_shared(size_bytes).map_err(|_| AiRuntimeErr::AllocFailed)?;
         let desc = AiTensorDesc::from_user_buffer(
             storage.as_mut_ptr() as u64,
             storage.len() as u64,
@@ -123,6 +123,6 @@ impl TensorManager {
             flags,
         );
 
-        Tensor { desc, storage }
+        Ok(Tensor { desc, storage })
     }
 }

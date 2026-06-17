@@ -18,15 +18,11 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use ov_channels::{ChannelId, Message, SharedMemory};
-
+use ov_channels::{ChannelId, Message, Receiver, Sender, SharedMemory};
 use crate::fronted::{AI_ABI_VERSION, AiGraphSubmitEntry};
+use k3_aiUabi::*;
+use k3_aiUabi::error::AiRuntimeErr;
 
-pub const K3_AI_IOC_BUILD_CHANNEL: u32 = 0x4B33_0001;
-pub const K3_AI_IOC_SUBMIT_GRAPH: u32 = 0x4B33_0002;
-
-// 先按 2 个 channel 走最小闭环。
-pub const K3_CHANNEL_COUNT: usize = 2;
 
 // 共享内存请求/返回参数。
 // 用户传入自己 mmap 出来的共享区地址和大小，内核校验它是否是 shared backend，
@@ -52,6 +48,8 @@ pub struct ChannelMemory {
 pub struct UringChannel {
     dev: File,
     pub shared: ChannelMemory,
+    graph_sender:Option<Sender<'static>>,
+    complete_reciver:Option<Receiver<'static>>
 }
 
 // 当前进程先只允许建立一个 channel，共享区一直保留到进程退出。
@@ -139,18 +137,17 @@ impl MmapMemory {
 }
 
 /// 打开 `/dev/k3_airunner`，mmap 共享内存并通过 `BUILD_CHANNEL` ioctl 让内核保活。
-pub fn build_channel() -> io::Result<UringChannel> {
+pub fn build_channel() -> Result<UringChannel, AiRuntimeErr> {
     let dev = OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/k3_airunner")?;
+        .open("/dev/k3_airunner")
+        .map_err(|_| AiRuntimeErr::DeviceOpenFailed)?;
 
     let shared_size = size_of::<SharedMemory<K3_CHANNEL_COUNT>>();
-    let mut memory = MmapMemory::new_shared(shared_size)?;
+    let mut memory = MmapMemory::new_shared(shared_size).map_err(|_| AiRuntimeErr::MmapFailed)?;
     let shared_ptr = memory.as_mut_ptr().cast::<c_void>();
 
-    // 这块共享区后面会被 ov-channels 当成固定布局的协议区使用，
-    // 所以在用户态先原地初始化。
     let shm = unsafe { &*(shared_ptr as *const SharedMemory<K3_CHANNEL_COUNT>) };
     shm.init();
 
@@ -170,7 +167,7 @@ pub fn build_channel() -> io::Result<UringChannel> {
         )
     };
     if ret < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(AiRuntimeErr::IoctlFailed);
     }
 
     let memory = Arc::new(memory);
@@ -188,12 +185,20 @@ pub fn build_channel() -> io::Result<UringChannel> {
         *slot = Some(memory);
     }
 
-    Ok(UringChannel { dev, shared })
+    let shm = unsafe { ov_channels::SharedMemory::<K3_CHANNEL_COUNT>::at(shared_ptr as usize) };
+    let sender_channel_0 = shm
+        .sender(ChannelId::new(K3_CHANNEL_SNEDERID))
+        .map_err(|_| AiRuntimeErr::ChannelNotInitialized)?;
+    let reciver_channel_1 = shm
+        .receiver(ChannelId::new(K3_CHANNEL_RECIVERID))
+        .map_err(|_| AiRuntimeErr::ChannelNotInitialized)?;
+
+    Ok(UringChannel { dev, shared, graph_sender: Some(sender_channel_0), complete_reciver: Some(reciver_channel_1) })
 }
 
 /// 用户接口
 /// 提交 graph 描述。当前仍然只通过 ioctl 把 `AiGraphSubmitEntry` 指针传给内核。
-pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) -> io::Result<()> {
+pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) -> Result<(), AiRuntimeErr> {
     let va = channel.shared.user_va;
 
     if va == 0
@@ -201,32 +206,19 @@ pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) ->
         || channel.shared._memory.len == 0
         || channel.shared._memory.ptr.is_null()
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid channel: va or size is zero",
-        ));
+        return Err(AiRuntimeErr::InvalidInput);
     }
 
     if graph_entry.abi_version != AI_ABI_VERSION {
-        // ABI错误
+        return Err(AiRuntimeErr::InvalidAbiVersion);
     }
 
-    // 建立channel,发entry
-    let shm = unsafe { ov_channels::SharedMemory::<K3_CHANNEL_COUNT>::at(va) };
-    let sender_channel_0 = shm
-        .sender(ChannelId::new(0))
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to get sender channel"))?;
+    let sender = channel.graph_sender.ok_or(AiRuntimeErr::ChannelNotInitialized)?;
 
-    // 序列化entry,发entry
-    let data = graph_entry.to_le_byte();
-    sender_channel_0
-        .try_send(&Message::data(data.unwrap()))
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "failed to send graph entry to channel",
-            )
-        })?;
+    let data = graph_entry.to_le_byte().ok_or(AiRuntimeErr::SerializeFailed)?;
+    sender
+        .try_send(&Message::data(data))
+        .map_err(|_| AiRuntimeErr::SendFailed)?;
 
     let ret = unsafe {
         ioctl(
@@ -236,13 +228,24 @@ pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) ->
         )
     };
     if ret < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(AiRuntimeErr::IoctlFailed);
     }
 
     Ok(())
 }
 
 /// completion 通路后续再接。
-pub fn wait_graph_complete(_graph_entry: &AiGraphSubmitEntry) {
-    todo!()
+pub fn wait_graph_complete(_graph_entry: &AiGraphSubmitEntry, channel: &UringChannel) -> Result<(), AiRuntimeErr> {
+    let reciver = channel.complete_reciver.ok_or(AiRuntimeErr::ChannelNotInitialized)?;
+
+    loop {
+        if let Some(msg) = reciver.try_recv() {
+            if let Some(token) = msg.as_notification() {
+                if token == _graph_entry.user_token {
+                    return Ok(());
+                }
+            }
+        }
+        std::thread::yield_now();
+    }
 }
