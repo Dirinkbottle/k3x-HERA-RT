@@ -2,9 +2,13 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::ptr::read_unaligned;
 
 use k3_aiUabi::{AiDtype, AiGraphNode, AiTensorDesc, AiTensorFormat, AiTensorLayout, KernelOp, MAX_DIM, MAX_SUBMIT_TENSORS};
+use k3_aiUabi::error::BackendErr;
+use log::error;
 pub mod matmul;
 
 /// backend 算子的 tensor 视图，`data` 指向当前地址空间可访问的连续内存。
@@ -40,8 +44,13 @@ impl Default for BackendTensorView {
 
 impl BackendTensorView {
     fn from_desc(desc: &AiTensorDesc) -> Self {
+
+        if desc.kernel_va==0 {
+            error!("desc tensor has null kernel_va!");
+        }
+
         Self {
-            data: desc.user_va as *mut u8,
+            data: desc.kernel_va as *mut u8,
             byte_len: desc.size_bytes,
             shape: desc.shape,
             stride_bytes: desc.stride_bytes,
@@ -71,7 +80,7 @@ pub struct BackendCall {
     pub attr_size: u32,
 }
 
-/// 内核入口,tensor地址需要已经被翻译为当前算子backend运行进程可以访问的地址空间地址
+/// 内核入口,tensor地址需要已经映射
 /// backend 算子分发入口，按 `call.op` 路由到对应算子执行器。
 pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
     let desc = &node.desc;
@@ -96,8 +105,18 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
         attr_size: desc.attr_size,
     };
 
-    match desc.op {
+    error!("k3_run_kernel: node_id={}, op={:?}, target_hint={}", node.node_id, desc.op, desc.target_hint.0);
+
+    let result = match desc.op {
         KernelOp::MAT_MUL => matmul::matmul_caller(&call),
-        _ => -1,
+        _ => Err(BackendErr::UnsupportedOp),
+    };
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            error!("k3_run_kernel failed: {:?}", e);
+            -1
+        }
     }
 }
