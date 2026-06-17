@@ -9,8 +9,8 @@
 | 任务 | 目标 |
 |---|---|
 | [*] 用户态 frontend 与 ring API | 完成用户态算子结构、最小 UAPI、ring entry 和 uring 用户 API（3 天） |
-| [ ] 纯线程内核执行路径 | 完成纯线程调度器、核心队列、worker、buffer pin/map/cache 最小路径（3 天） |
-| [ ] completion 回到用户态 | job/node/graph 完成后能通知用户态等待方（2 天） |
+| [*] 纯线程内核执行路径 | 完成纯线程调度器、核心队列、worker、buffer pin/map/cache 最小路径（3 天） |
+| [*] completion 回到用户态 | job/node/graph 完成后能通知用户态等待方（2 天） |
 | [ ] CPU fallback MatMul | 用 CPU fallback 跑通 MatMul 正确性（2 天） |
 | [ ] A100/X100 IME probe | 验证 A100/X100 IME backend 的最小执行与结果正确性（2 天） |
 | [ ] ggml `mul_mat` 接入 | llama.cpp 的核心矩阵乘法能走用户态算子库（5 天） |
@@ -24,15 +24,15 @@
   - [x] 最小 MatMul UAPI / submit struct / ring entry
   - [x] graph submit 到 ring
   - [x] uring 用户 API
-- [ ] 纯线程内核执行路径（3 天）
+- [x] 纯线程内核执行路径（3 天）
   - [x] 用户态 backend 算子库骨架
-  - [ ] 纯线程内核调度器
-  - [ ] 核心队列与 worker
+  - [x] 纯线程内核调度器
+  - [x] 核心队列与 worker
   - [x] buffer pin/map/cache 最小路径
-- [ ] completion 回到用户态（2 天）
-  - [ ] completion ring entry
-  - [ ] token 匹配与错误码返回
-  - [ ] 用户态等待/唤醒 API
+- [x] completion 回到用户态（2 天）
+  - [x] completion ring entry
+  - [x] token 匹配与错误码返回
+  - [x] 用户态等待/唤醒 API
 - [ ] CPU fallback MatMul（2 天）
   - [ ] CPU fallback MatMul 实现
   - [ ] MatMul golden case 对比
