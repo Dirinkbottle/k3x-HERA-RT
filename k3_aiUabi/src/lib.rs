@@ -7,6 +7,7 @@ pub mod desc;
 pub mod graph;
 pub mod kernel;
 pub mod kernelattr;
+pub mod error;
 
 pub use desc::*;
 pub use graph::*;
@@ -30,3 +31,17 @@ pub const MAX_STRIDE_BYTE: usize = 0x1_0000_0000;
 ///
 /// 约定：`tensors[0..input_count]` 是输入，紧随其后的 `output_count` 个是输出。
 pub const MAX_SUBMIT_TENSORS: usize = 8;
+
+
+
+/// TODO:注释
+
+pub const K3_AI_IOC_BUILD_CHANNEL: u32 = 0x4B33_0001;
+pub const K3_AI_IOC_SUBMIT_GRAPH: u32 = 0x4B33_0002;
+
+//  2 个 channel 走最小闭环。
+pub const K3_CHANNEL_COUNT: usize = 2;
+
+
+pub const K3_CHANNEL_SNEDERID:u8 = 0;
+pub const K3_CHANNEL_RECIVERID:u8 = 1;
