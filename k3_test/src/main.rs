@@ -5,7 +5,7 @@ use std::os::raw::{c_int, c_void};
 
 use k3_aiRuntime::fronted::{
     AiDtype, AiKernelDesc, AiTargetHint, GraphManager, MatMulAttr, TensorManager,
-    kd_uring::{build_channel, submit_graph}
+    kd_uring::{build_channel, submit_graph, wait_graph_complete}
 };
 
 unsafe extern "C" {
@@ -36,61 +36,100 @@ fn main() {
     let tensor_mgr = TensorManager::new();
     let mut graph = GraphManager::new();
 
-    // matmul: 2×3 @ 3×5 = 2×5
-    let mut lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
-    let mut rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[3, 5]);
-    let out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 5]);
+    // DAG: a 和 b 并行，d 依赖 a 和 b
+    // a: 2×3 @ 3×2 = 2×2
+    // b: 2×2 @ 2×3 = 2×3
+    // d: 2×2 @ 2×3 = 2×3 (使用 a_out 和 b_out)
 
-    // 填充 lhs 数据: [[1, 2, 3], [4, 5, 6]]
-    let lhs_data = lhs.as_f32_mut_slice();
-    lhs_data[0] = 1.0; lhs_data[1] = 2.0; lhs_data[2] = 3.0;
-    lhs_data[3] = 4.0; lhs_data[4] = 5.0; lhs_data[5] = 6.0;
+    // === node a ===
+    let mut a_lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
+    let mut a_rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[3, 2]);
+    let a_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 2]);
 
-    // 填充 rhs 数据: [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 1, 0, 0]]
-    let rhs_data = rhs.as_f32_mut_slice();
-    for i in 0..15 { rhs_data[i] = 0.0; }
-    rhs_data[0] = 1.0; rhs_data[6] = 1.0; rhs_data[12] = 1.0;
+    {
+        let lhs = a_lhs.as_f32_mut_slice();
+        lhs[0] = 1.0; lhs[1] = 2.0; lhs[2] = 3.0;
+        lhs[3] = 4.0; lhs[4] = 5.0; lhs[5] = 6.0;
 
-    let matmul_attr = MatMulAttr {
-        m: 2,
-        n: 5,
-        k: 3,
-        batch: 0,
-        lhs_row_stride: 3,
-        lhs_col_stride: 1,
-        lhs_batch_stride: 0,
-        rhs_row_stride: 5,
-        rhs_col_stride: 1,
-        rhs_batch_stride: 0,
-        out_row_stride: 5,
-        out_col_stride: 1,
-        out_batch_stride: 0,
-        flags: 0,
-        accum_dtype: AiDtype::F32,
-        reserved: [0; 3],
-    };
+        let rhs = a_rhs.as_f32_mut_slice();
+        rhs[0] = 1.0; rhs[1] = 0.0;
+        rhs[2] = 0.0; rhs[3] = 1.0;
+        rhs[4] = 0.0; rhs[5] = 0.0;
+    }
 
-    let matmul_desc = AiKernelDesc::new(
-        &matmul_attr, AiTargetHint::AUTO, 2, 1,
-        &[lhs.desc(), rhs.desc(), out.desc()]
-    );
-    let _node = graph.push_kernel_no_depend(matmul_desc).expect("failed to push matmul");
+    let a_node = graph.push_kernel_no_depend(AiKernelDesc::new(
+        &MatMulAttr {
+            m: 2, n: 2, k: 3, batch: 0,
+            lhs_row_stride: 3, lhs_col_stride: 1, lhs_batch_stride: 0,
+            rhs_row_stride: 2, rhs_col_stride: 1, rhs_batch_stride: 0,
+            out_row_stride: 2, out_col_stride: 1, out_batch_stride: 0,
+            flags: 0, accum_dtype: AiDtype::F32, reserved: [0; 3],
+        },
+        AiTargetHint::PREFER_CPU, 2, 1,
+        &[a_lhs.desc(), a_rhs.desc(), a_out.desc()]
+    )).expect("failed to push node a");
 
-    // 冻结并提交
+    // === node b ===
+    let mut b_lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 2]);
+    let mut b_rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
+    let b_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
+
+    {
+        let lhs = b_lhs.as_f32_mut_slice();
+        lhs[0] = 2.0; lhs[1] = 0.0;
+        lhs[2] = 0.0; lhs[3] = 2.0;
+
+        let rhs = b_rhs.as_f32_mut_slice();
+        rhs[0] = 1.0; rhs[1] = 2.0; rhs[2] = 3.0;
+        rhs[3] = 4.0; rhs[4] = 5.0; rhs[5] = 6.0;
+    }
+
+    let b_node = graph.push_kernel_no_depend(AiKernelDesc::new(
+        &MatMulAttr {
+            m: 2, n: 3, k: 2, batch: 0,
+            lhs_row_stride: 2, lhs_col_stride: 1, lhs_batch_stride: 0,
+            rhs_row_stride: 3, rhs_col_stride: 1, rhs_batch_stride: 0,
+            out_row_stride: 3, out_col_stride: 1, out_batch_stride: 0,
+            flags: 0, accum_dtype: AiDtype::F32, reserved: [0; 3],
+        },
+        AiTargetHint::PREFER_CPU, 2, 1,
+        &[b_lhs.desc(), b_rhs.desc(), b_out.desc()]
+    )).expect("failed to push node b");
+
+    // === node d: 依赖 a 和 b ===
+    let d_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
+
+    let _d_node = graph.push_kernel_depend_many(
+        &[a_node, b_node],
+        AiKernelDesc::new(
+            &MatMulAttr {
+                m: 2, n: 3, k: 2, batch: 0,
+                lhs_row_stride: 2, lhs_col_stride: 1, lhs_batch_stride: 0,
+                rhs_row_stride: 3, rhs_col_stride: 1, rhs_batch_stride: 0,
+                out_row_stride: 3, out_col_stride: 1, out_batch_stride: 0,
+                flags: 0, accum_dtype: AiDtype::F32, reserved: [0; 3],
+            },
+            AiTargetHint::PREFER_CPU, 2, 1,
+            &[a_out.desc(), b_out.desc(), d_out.desc()]
+        )
+    ).expect("failed to push node d");
+
     let blob = graph.freeze().expect("failed to freeze graph");
-    let entry = blob.submit_entry(0);
+    let entry = blob.submit_entry(42);
 
-    println!("k3_test: submitting 2×5 matmul");
+    println!("k3_test: submitting DAG graph (a || b) -> d");
     submit_graph(&channel, &entry).expect("failed to submit graph");
-    println!("k3_test: graph submitted successfully");
 
-    // 打印结果
-    let result = out.as_f32_slice();
-    println!("result (2×5):");
+    if let Err(e) = wait_graph_complete(&entry, &channel) {
+        println!("graph execute fail with err {}", e);
+    }
+
+    println!("d result (2×3):");
+    let result = d_out.as_f32_slice();
     for i in 0..2 {
         print!("  [");
-        for j in 0..5 {
-            print!("{:6.1}", result[i * 5 + j]);
+        for j in 0..3 {
+            print!("{:6.1}", result[i * 3 + j]);
         }
         println!(" ]");
     }
