@@ -42,9 +42,9 @@ fn main() {
     // d: 2×2 @ 2×3 = 2×3 (使用 a_out 和 b_out)
 
     // === node a ===
-    let mut a_lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
-    let mut a_rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[3, 2]);
-    let a_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 2]);
+    let mut a_lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]).expect("alloc a_lhs failed");
+    let mut a_rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[3, 2]).expect("alloc a_rhs failed");
+    let a_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 2]).expect("alloc a_out failed");
 
     {
         let lhs = a_lhs.as_f32_mut_slice();
@@ -70,9 +70,9 @@ fn main() {
     )).expect("failed to push node a");
 
     // === node b ===
-    let mut b_lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 2]);
-    let mut b_rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
-    let b_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
+    let mut b_lhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 2]).expect("alloc b_lhs failed");
+    let mut b_rhs = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]).expect("alloc b_rhs failed");
+    let b_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]).expect("alloc b_out failed");
 
     {
         let lhs = b_lhs.as_f32_mut_slice();
@@ -97,7 +97,7 @@ fn main() {
     )).expect("failed to push node b");
 
     // === node d: 依赖 a 和 b ===
-    let d_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]);
+    let d_out = tensor_mgr.alloc_tensor(AiDtype::F32, &[2, 3]).expect("alloc d_out failed");
 
     let _d_node = graph.push_kernel_depend_many(
         &[a_node, b_node],

@@ -19,7 +19,7 @@ fn build_matmul_kernel_desc() {
         accum_dtype: AiDtype::F32,
         ..Default::default()
     };
-    let tensors = [lhs.desc(), rhs.desc(), output.desc()];
+    let tensors = [lhs.expect("REASON").desc(), rhs.expect("REASON").desc(), output.expect("REASON").desc()];
     let matmul_desc = AiKernelDesc::new(&matmul_attr, AiTargetHint::AUTO, 2, 1, &tensors);
     let mut graph = GraphManager::new();
     graph
