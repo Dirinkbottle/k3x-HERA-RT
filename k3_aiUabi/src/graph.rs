@@ -53,7 +53,7 @@ pub struct AiGraphSubmitEntry {
 
     /// 用户态 completion cookie。
     /// 用户态用它匹配完成的 graph。
-    pub user_token: u64,
+    pub user_token: u32,
 
     /// graph blob 的用户态虚拟地址。
     pub graph_user_va: u64,
@@ -78,7 +78,7 @@ impl Default for AiGraphSubmitEntry {
 
 impl AiGraphSubmitEntry {
     pub fn new(
-        user_token: u64,
+        user_token: u32,
         graph_user_va: u64,
         graph_size: u64,
         submit_kind: GraphSubmitKind,
@@ -243,7 +243,7 @@ impl AiGraphBlob {
         &self.bytes
     }
 
-    pub fn submit_entry(&self, user_token: u64) -> AiGraphSubmitEntry {
+    pub fn submit_entry(&self, user_token: u32) -> AiGraphSubmitEntry {
         AiGraphSubmitEntry::new(
             user_token,
             self.bytes.as_ptr() as u64,

@@ -102,6 +102,9 @@ pub struct AiTensorDesc {
     /// 用户态虚拟地址。
     pub user_va: u64,
 
+    /// 内核态虚拟地址。 由内核创建alias后填写
+    pub kernel_va: u64,
+
     /// 该 tensor 可访问的完整 buffer 字节数。
     pub size_bytes: u64,
 
