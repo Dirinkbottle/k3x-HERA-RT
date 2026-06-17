@@ -7,7 +7,7 @@ extern crate alloc;
 pub mod kd_kring;
 pub mod scheduler;
 
-use core::alloc::Layout;
+use core::{alloc::Layout, usize};
 
 /// 调度器需要的操作系统接口。
 pub trait K3SchedulerOps {
@@ -31,4 +31,10 @@ pub trait K3SchedulerOps {
 
     /// 取消用户地址到内核地址的映射。
     unsafe fn unmap_user(&self, kernel_va: u64, len: usize) -> Result<(), ()>;
+
+
+    ///启动新线程
+    fn spawn_thread(&self,f:fn(usize),arg:usize);
 }
+
+pub struct Caller{}

@@ -114,6 +114,7 @@
 use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 use alloc::vec;
 use k3_aiUabi::{AiGraphNode, AiParsedGraph};
+use k3_aiUabi::error::SchedulerErr;
 
 /// 内核侧把一张 DAG 收敛成的单条调度链。
 ///
@@ -149,17 +150,6 @@ impl TaskLink {
     }
 }
 
-/// graph 解析失败。
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ResolveGraphError {
-    BadNodeId(u32),
-    BadEdge { from_node: u32, to_node: u32 },
-    CycleDetected,
-}
-
-
-
-
 /// 根据 edge 关系把一张解析后的 graph 收成可调度的直链。
 ///
 /// 阶段一先做稳定拓扑排序：
@@ -168,14 +158,14 @@ pub enum ResolveGraphError {
 /// - 节点完成后减少后继入度，新的 ready 节点再入队。
 ///
 /// 这样 `a -> b, c -> b` 会解析成 `a -> c -> b` 或其他满足 edge 约束的稳定顺序。
-pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink, ResolveGraphError> {
+pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink, SchedulerErr> {
     let node_count = graph.nodes.len();
     let mut indegree = vec![0_usize; node_count];
     let mut outgoing = vec![Vec::new(); node_count];
 
     for (idx, node) in graph.nodes.iter().enumerate() {
         if node.node_id != idx as u32 {
-            return Err(ResolveGraphError::BadNodeId(node.node_id));
+            return Err(SchedulerErr::ParseFailed);
         }
     }
 
@@ -183,10 +173,7 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
         let from = edge.from_node as usize;
         let to = edge.to_node as usize;
         if from >= node_count || to >= node_count {
-            return Err(ResolveGraphError::BadEdge {
-                from_node: edge.from_node,
-                to_node: edge.to_node,
-            });
+            return Err(SchedulerErr::ParseFailed);
         }
 
         outgoing[from].push(edge.to_node);
@@ -214,7 +201,7 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
     }
 
     if node_order.len() != node_count {
-        return Err(ResolveGraphError::CycleDetected);
+        return Err(SchedulerErr::ParseFailed);
     }
 
     let mut next_node = vec![None; node_count];
@@ -327,10 +314,7 @@ mod tests {
         match resolve_parsed_graph(1, &parsed) {
             Err(err) => assert_eq!(
                 err,
-                ResolveGraphError::BadEdge {
-                    from_node: 0,
-                    to_node: 3,
-                }
+                SchedulerErr::ParseFailed           
             ),
             Ok(_) => panic!("resolve_graph should reject out-of-range edge"),
         }
@@ -350,7 +334,7 @@ mod tests {
         });
 
         match resolve_parsed_graph(2, &parsed) {
-            Err(err) => assert_eq!(err, ResolveGraphError::CycleDetected),
+            Err(err) => assert_eq!(err, SchedulerErr::ParseFailed),
             Ok(_) => panic!("resolve_graph should reject cycle graph"),
         }
     }
