@@ -1,6 +1,7 @@
 # Summary
 
 [项目介绍](./introduction.md)
+[怎么使用/复现本项目](./how_to_use.md)
 [特别说明和信息](./information.md)
 [开发进度](./progress.md)
 
