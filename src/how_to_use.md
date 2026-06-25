@@ -48,7 +48,7 @@ rustup target add riscv64gc-unknown-none-elf
 在 **tgoskits 仓库根目录** 下执行：
 
 ```bash
-cd /home/inkbottle/othersrc/tgoskits
+cd tgoskits
 cargo starry qemu --arch riscv64
 ```
 
@@ -62,7 +62,7 @@ cargo starry qemu --arch riscv64
 在 tgoskits 仓库根目录下，使用 K3 板级配置构建：
 
 ```bash
-cd /home/inkbottle/othersrc/tgoskits
+cd tgoskits
 cargo starry build --config os/StarryOS/configs/board/spacemitk3-com260kit.toml
 ```
 
@@ -151,4 +151,4 @@ ls /dev/k3_airunner
 ## 注意事项
 
 - **V 扩展上下文支持**：StarryOS 当前不支持 RISC-V V 扩展的上下文保存/恢复。所有 IME 指令依赖 V 扩展，在补齐 V 上下文支持之前，A100/X100 IME backend 无法在 StarryOS 多任务环境下安全使用。
-- **板级驱动状态**：UFS 驱动已完成，SD 卡驱动和 GMAC 网卡驱动仍在开发中。
+- **板级驱动状态**：UFS 驱动任在测试,但可以满足基本需求，SD 卡驱动和 GMAC 网卡驱动仍在开发中。
