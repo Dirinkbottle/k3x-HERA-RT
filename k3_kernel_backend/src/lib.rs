@@ -6,8 +6,11 @@ extern crate alloc;
 
 use core::ptr::read_unaligned;
 
-use k3_aiUabi::{AiDtype, AiGraphNode, AiTensorDesc, AiTensorFormat, AiTensorLayout, KernelOp, MAX_DIM, MAX_SUBMIT_TENSORS};
 use k3_aiUabi::error::BackendErr;
+use k3_aiUabi::{
+    AiDtype, AiGraphNode, AiTensorDesc, AiTensorFormat, AiTensorLayout, KernelOp, MAX_DIM,
+    MAX_SUBMIT_TENSORS,
+};
 use log::error;
 pub mod matmul;
 
@@ -44,8 +47,7 @@ impl Default for BackendTensorView {
 
 impl BackendTensorView {
     fn from_desc(desc: &AiTensorDesc) -> Self {
-
-        if desc.kernel_va==0 {
+        if desc.kernel_va == 0 {
             error!("desc tensor has null kernel_va!");
         }
 
@@ -91,7 +93,8 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
         input_views[i] = BackendTensorView::from_desc(&desc.tensors[i]);
     }
     for i in 0..desc.output_count as usize {
-        output_views[i] = BackendTensorView::from_desc(&desc.tensors[desc.input_count as usize + i]);
+        output_views[i] =
+            BackendTensorView::from_desc(&desc.tensors[desc.input_count as usize + i]);
     }
 
     let call = BackendCall {
@@ -105,7 +108,10 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
         attr_size: desc.attr_size,
     };
 
-    error!("k3_run_kernel: node_id={}, op={:?}, target_hint={}", node.node_id, desc.op, desc.target_hint.0);
+    error!(
+        "k3_run_kernel: node_id={}, op={:?}, target_hint={}",
+        node.node_id, desc.op, desc.target_hint.0
+    );
 
     let result = match desc.op {
         KernelOp::MAT_MUL => matmul::matmul_caller(&call),

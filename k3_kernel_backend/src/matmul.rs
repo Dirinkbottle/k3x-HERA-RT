@@ -8,8 +8,8 @@ use core::ops::{Add, Mul};
 use core::slice;
 
 use crate::BackendCall;
-use k3_aiUabi::{AiDtype, MatMulAttr};
 use k3_aiUabi::error::BackendErr;
+use k3_aiUabi::{AiDtype, MatMulAttr};
 use log::error;
 
 /// matmul 算子的输入输出参数集合，供 a100/x100/cpu 分发使用。
@@ -29,7 +29,10 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
 
     let call = unsafe { &*call };
     if call.input_count != 2 || call.output_count != 1 {
-        error!("matmul_caller: invalid input/output count, input_count={}, output_count={}", call.input_count, call.output_count);
+        error!(
+            "matmul_caller: invalid input/output count, input_count={}, output_count={}",
+            call.input_count, call.output_count
+        );
         return Err(BackendErr::InvalidInput);
     }
     if call.inputs.is_null() || call.outputs.is_null() {
@@ -46,15 +49,25 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
     }
 
     if call.attr.is_null() || call.attr_size < size_of::<MatMulAttr>() as u32 {
-        error!("matmul_caller: invalid attr, is_null={}, attr_size={}", call.attr.is_null(), call.attr_size);
+        error!(
+            "matmul_caller: invalid attr, is_null={}, attr_size={}",
+            call.attr.is_null(),
+            call.attr_size
+        );
         return Err(BackendErr::InvalidAttr);
     }
 
     let attr = unsafe { core::ptr::read_unaligned(call.attr.cast::<MatMulAttr>()) };
 
     // 目前只支持 F32
-    if inputs[0].dtype != AiDtype::F32 || inputs[1].dtype != AiDtype::F32 || outputs[0].dtype != AiDtype::F32 {
-        error!("matmul_caller: unsupported dtype, input0={:?}, input1={:?}, output={:?}", inputs[0].dtype, inputs[1].dtype, outputs[0].dtype);
+    if inputs[0].dtype != AiDtype::F32
+        || inputs[1].dtype != AiDtype::F32
+        || outputs[0].dtype != AiDtype::F32
+    {
+        error!(
+            "matmul_caller: unsupported dtype, input0={:?}, input1={:?}, output={:?}",
+            inputs[0].dtype, inputs[1].dtype, outputs[0].dtype
+        );
         return Err(BackendErr::UnsupportedDtype);
     }
 
@@ -101,16 +114,19 @@ fn x100<T>(_parameter: MatmulParameter<'_, T>) -> Result<(), BackendErr> {
 /// CPU fallback matmul 实现。
 fn cpu<T>(parameter: MatmulParameter<'_, T>) -> Result<(), BackendErr>
 where
-    T: Debug+ Default + Copy + Add<Output = T> + Mul<Output = T>,
+    T: Debug + Default + Copy + Add<Output = T> + Mul<Output = T>,
 {
-
     error!("run mutmal in cpu");
 
     let attr = &parameter.attr;
     let m = attr.m as usize;
     let n = attr.n as usize;
     let k = attr.k as usize;
-    let batch = if attr.batch == 0 { 1 } else { attr.batch as usize };
+    let batch = if attr.batch == 0 {
+        1
+    } else {
+        attr.batch as usize
+    };
 
     let lhs_row_stride = attr.lhs_row_stride as usize;
     let lhs_col_stride = attr.lhs_col_stride as usize;
@@ -141,7 +157,6 @@ where
             }
         }
     }
-
 
     ///TODO: 后面必须实现写回同步
 
