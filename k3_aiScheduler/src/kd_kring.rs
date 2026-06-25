@@ -110,11 +110,10 @@
 //! 本次 graph bind 住的 tensor ref。用户态看到 completion 后才允许安全复用或 free
 //! 相关 tensor。
 
-
-use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 use alloc::vec;
-use k3_aiUabi::{AiGraphNode, AiParsedGraph};
+use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 use k3_aiUabi::error::SchedulerErr;
+use k3_aiUabi::{AiGraphNode, AiParsedGraph};
 
 /// 内核侧把一张 DAG 收敛成的单条调度链。
 ///
@@ -226,9 +225,7 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
 
 #[cfg(test)]
 mod tests {
-    use k3_aiUabi::{
-        AiGraphBuildError, AiGraphEdge, AiGraphParser, AiKernelDesc, GraphManager,
-    };
+    use k3_aiUabi::{AiGraphBuildError, AiGraphEdge, AiGraphParser, AiKernelDesc, GraphManager};
 
     use super::*;
 
@@ -312,10 +309,7 @@ mod tests {
         });
 
         match resolve_parsed_graph(1, &parsed) {
-            Err(err) => assert_eq!(
-                err,
-                SchedulerErr::ParseFailed           
-            ),
+            Err(err) => assert_eq!(err, SchedulerErr::ParseFailed),
             Ok(_) => panic!("resolve_graph should reject out-of-range edge"),
         }
     }

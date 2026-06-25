@@ -32,9 +32,8 @@ pub trait K3SchedulerOps {
     /// 取消用户地址到内核地址的映射。
     unsafe fn unmap_user(&self, kernel_va: u64, len: usize) -> Result<(), ()>;
 
-
     ///启动新线程
-    fn spawn_thread(&self,f:fn(usize),arg:usize);
+    fn spawn_thread(&self, f: fn(usize), arg: usize);
 }
 
-pub struct Caller{}
+pub struct Caller {}
