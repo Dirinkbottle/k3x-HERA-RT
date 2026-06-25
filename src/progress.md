@@ -11,7 +11,7 @@
 | [*] 用户态 frontend 与 ring API | 完成用户态算子结构、最小 UAPI、ring entry 和 uring 用户 API（3 天） |
 | [*] 纯线程内核执行路径 | 完成纯线程调度器、核心队列、worker、buffer pin/map/cache 最小路径（3 天） |
 | [*] completion 回到用户态 | job/node/graph 完成后能通知用户态等待方（2 天） |
-| [ ] CPU fallback MatMul | 用 CPU fallback 跑通 MatMul 正确性（2 天） |
+| [*] CPU fallback MatMul | 用 CPU fallback 跑通 MatMul 正确性（2 天） |
 | [ ] A100/X100 IME probe | 验证 A100/X100 IME backend 的最小执行与结果正确性（2 天） |
 | [ ] ggml `mul_mat` 接入 | llama.cpp 的核心矩阵乘法能走用户态算子库（5 天） |
 | [ ] llama.cpp 文本生成跑通 | 改造后的 ggml backend 能跑通一个文本生成模型（5 天） |
@@ -34,7 +34,7 @@
   - [x] token 匹配与错误码返回
   - [x] 用户态等待/唤醒 API
 - [ ] CPU fallback MatMul（2 天）
-  - [ ] CPU fallback MatMul 实现
+  - [x] CPU fallback MatMul 实现
   - [ ] MatMul golden case 对比
 - [ ] A100/X100 IME probe（2 天）
   - [ ] 使用官方支持文档和工具链编写最小 IME probe
