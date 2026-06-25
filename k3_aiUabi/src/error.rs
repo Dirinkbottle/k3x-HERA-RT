@@ -115,5 +115,3 @@ impl fmt::Display for BackendErr {
         }
     }
 }
-
-

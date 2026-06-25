@@ -3,10 +3,10 @@
 //! channel里提交的是 `AiGraphSubmitEntry`
 //! graph blob 内部用 offset 组织节点和边。
 
-use core::mem;
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use bitflags::bitflags;
+use core::mem;
 
 use crate::{AI_ABI_VERSION, AiKernelDesc};
 
@@ -94,15 +94,15 @@ impl AiGraphSubmitEntry {
         }
     }
     /// 序列化提交
-    pub fn to_le_byte(&self)->Option<&[u8]>{
+    pub fn to_le_byte(&self) -> Option<&[u8]> {
         let self_size = core::mem::size_of::<Self>();
-        if self_size>255 {
-            return None
+        if self_size > 255 {
+            return None;
         }
         unsafe {
             Some(core::slice::from_raw_parts(
                 self as *const Self as *const u8,
-                self_size
+                self_size,
             ))
         }
     }
@@ -147,19 +147,19 @@ pub struct AiGraphNode {
     /// 单个 lowered 算子的描述。
     pub desc: AiKernelDesc,
     /// Graph节点的状态
-    pub state:AiGraphState
+    pub state: AiGraphState,
 }
 
 /// 表示某个图节点的执行状态
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct AiGraphState{
-    complete:bool,
+pub struct AiGraphState {
+    complete: bool,
     // bitflag 按位解释错误原因
-    error_flag:u8,
+    error_flag: u8,
 }
 
-bitflags!{
+bitflags! {
     pub struct GraphAiErrorFlags: u32 {
         const A = 0b00000001;
         const B = 0b00000010;
@@ -366,7 +366,11 @@ impl GraphManager {
     fn push_node(&mut self, desc: AiKernelDesc) -> Result<AiGraphChainId, AiGraphBuildError> {
         let node_id =
             u32::try_from(self.nodes.len()).map_err(|_| AiGraphBuildError::TooManyNodes)?;
-        self.nodes.push(AiGraphNode { node_id, desc,state:AiGraphState::default()});
+        self.nodes.push(AiGraphNode {
+            node_id,
+            desc,
+            state: AiGraphState::default(),
+        });
         Ok(AiGraphNodeId(node_id))
     }
 

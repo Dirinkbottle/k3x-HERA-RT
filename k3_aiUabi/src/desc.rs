@@ -15,11 +15,8 @@ use super::kernelattr::AiKernelAttr;
 /// ggml 量化格式先作为 dtype 编号保留下来。
 /// 量化块内部布局由 `AiTensorLayout::GGML_QUANT` 和 `AiQuantDesc` 补充说明。
 #[repr(transparent)]
-#[derive(Clone, Copy, Default, Eq, PartialEq,Debug)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Debug)]
 pub struct AiDtype(pub u32);
-
-
-
 
 /// 内联算子参数区大小。
 pub const ATTR_INLINE_SIZE: usize = 128;

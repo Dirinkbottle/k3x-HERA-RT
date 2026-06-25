@@ -1,6 +1,5 @@
 //! ring 中的算子编号与目标倾向。
 
-
 /// ring 中的算子编号。
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
