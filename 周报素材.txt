@@ -1,0 +1,493 @@
+1.这次是探索到了驱动移植到一个快速方法,如何在用模型垃圾的情况下进行linux驱动移植到rust操作系统
+核心就是bindgen生成寄存器和c2rust.
+
+
+
+2.修复了个页表同步的bug.   user进入内核syscall时用的是用户的页表
+
+
+3.补齐了starry riscv的dma缓存同步
+
+
+
+
+4.ai核心亲和性的切换
+root@starry:/root # cat /proc/set_ai_thread 
+[ 57.835644 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 57.846619 8:58 starry_kernel::task::user:25] Enter user space: ip=0x6013d7ae, sp=0x3fffff570
+Write '1' or 'self' to mark curr[ 57.864193 8:58 starry_kernel::task::ops:534] Task(58, "busybox") exit with code: 0
+ent thread as AI thread.
+Write '0' or '-self' to unmark current thread.
+
+
+No AI threads currently marked.
+[ 57.888455 8:58 starry_kernel::task::signal:561] Send signal SIGCHLD to process 1
+[ 57.895316 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 57.905943 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WNOHANG | WUNTRACED)
+root@starry:/root # echo 1 > /proc/set_ai_thread 
+root@starry:/root # cat /proc/set_ai_thread 
+[ 66.019155 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 66.030127 8:59 starry_kernel::task::user:25] Enter user space: ip=0x6013d7ae, sp=0x3fffff570
+Write '1' or 'self' to mark curr[ 66.047660 8:59 starry_kernel::task::ops:534] Task(59, "busybox") exit with code: 0
+ent thread as AI thread.
+Write '0' or '-self' to unmark current thread.
+
+
+Current AI threads (1):
+  core=8   tid=1      pid=1      busybox
+[ 66.074593 8:59 starry_kernel::task::signal:561] Send signal SIGCHLD to process 1
+[ 66.081457 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 66.092079 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WNOHANG | WUNTRACED)
+root@starry:/root # echo 1 > /proc/set_ai_thread 
+root@starry:/root # cat /proc/set_ai_thread 
+[ 74.705977 9:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 74.714695 9:62 starry_kernel::task::user:25] Enter user space: ip=0x6013d7ae, sp=0x3fffff570
+Write '1' or 'self' to mark current thread as AI thr[ 74.742455 9:62 starry_kernel::task::ops:534] Task(62, "busybox") exit with code: 0
+[ 74.751369 9:62 starry_kernel::task::signal:561] Send signal SIGCHLD to process 1
+ead.
+Wr[ 74.761227 9:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 74.772429 9:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WNOHANG | WUNTRACED)
+ite '0' or '-self' to unmark current thread.
+
+
+Current AI threads (1):
+  core=9   tid=1      pid=1      busybox
+root@starry:/root # echo 1 > /proc/set_ai_thread 
+root@starry:/root # cat /proc/set_ai_thread 
+[ 83.906234 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 83.917212 8:65 starry_kernel::task::user:25] Enter user space: ip=0x6013d7ae, sp=0x3fffff570
+Write '1' or 'self' to mark curr[ 83.934759 8:65 starry_kernel::task::ops:534] Task(65, "busybox") exit with code: 0
+ent thread as AI thread.
+Write '0' or '-self' to unmark current thread.
+
+
+Current AI threads (1):
+  core=8   tid=1      pid=1      busybox
+[ 83.961653 8:65 starry_kernel::task::signal:561] Send signal SIGCHLD to process 1
+[ 83.968506 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 83.979133 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WNOHANG | WUNTRACED)
+root@starry:/root # exit
+
+
+
+5.v扩展开启了,但是目前没有维护寄存器的保存与恢复. 我们用spacemit的k3交叉编译工具编译测试ime的matmul算子.
+root@starry:/root # ./ime_a100 
+[ 94.270754 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 94.281713 8:59 starry_kernel::task::user:25] Enter user space: ip=0x6013d7ae, sp=0x3fffff570
+=== SpacemiT IME smt.vmadot i8 matmul (tile 4×8×4) ===
+
+A (4×8, row-major, first 32 of 128 bytes in vreg):
+   0    1    2    3    4    5    6    7 
+   1    2    3    4    5    6    7    8 
+   2    3    4    5    6    7    8    9 
+   4    5    6    7    8    9   10   11 
+
+B (4×8, column-major):
+   0    1    2    3    4    5    6    7 
+   1    2    3    4    5    6    7    8 
+   2    3    4    5    6    7    8    9 
+  11    4    5    6    7    8    9   10 
+
+C = A × B^T  (4×4 tile from 64-element vreg store):
+  IME        Ref        Match
+  140        140        ✓ | 168        168        ✓ | 196        196        ✓ | 224        224        ✓
+  168        168        ✓ | 204        204        ✓ | 240        240        ✓ | 284        284        ✓
+  196        196        ✓ | 240        240        ✓ | 284        284        ✓ | 344        344        ✓
+  252        252        ✓ | 312        312        ✓ | 372        372        ✓ | 464        464        ✓
+
+Pad region check (should all be 0 or 0xFFFFFFFF):
+  C[16..63]: all 0xFFFFFFFF (untouched by smt.vmadot)
+
+=== P[ 94.478246 8:59 starry_kernel::task::ops:534] Task(59, "ime_a100") exit with code: 0
+[ 94.487234 8:59 starry_kernel::task::signal:561] Send signal SIGCHLD to process 1
+[ 94.496243 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 94.507641 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WNOHANG | WUNTRACED)
+ASS ===
+root@starry:/root # 
+
+
+
+
+6.vector寄存器保存与恢复测试
+使用/home/inkbottle/othersrc/k3x-HERA-RT/vector_switch_test.c进行测试
+root@starry:/root # ./vector_switch_test 128
+[  5.252123 0:43 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[  5.252659 0:59 starry_kernel::task::user:25] Enter user space: ip=0x6013d7ae, sp=0x3fffff570
+=== Vector Register Context Switch Test ===
+HW VLEN = 128 bits  |  vlenb = 16  |  m8 group = 128 bytes
+
+[main] Test-1: same-thread yield
+[main] filled main patterns, yielding...
+[main] Test-1 PASS
+
+[main] Test-2+3: cross-thread
+[main] worker created, waiting...
+[  5.304223 0:60 starry_kernel::task::user:25] Enter user space: ip=0x14e22, sp=0x3eef0
+[worker] started (vlenb=16, m8=128)
+[worker] Test-A PASS
+[worker] filled worker patterns, yielding...
+[worker] Test-C PASS
+[worker] done
+[  5.316011 0:60 starry_kernel::task::ops:534] Task(60, "vector_switch_test") exit with code: 0
+[main] worker joined
+[main] Test-3 PASS
+
+=== ALL PASS ===
+[  5.322264 0:59 starry_kernel::task::ops:534] Task(59, "vector_switch_test") exit with code: 0
+[  5.344570 0:59 starry_kernel::task::signal:561] Send signal SIGCHLD to process 1
+[  5.349876 0:43 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[  5.350612 0:43 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WNOHANG | WUNTRACED)
+
+测试方法：
+  使用 riscv64-unknown-linux-musl-gcc -march=rv64gcv 编译，运行时自动从 vlenb CSR
+  读取硬件 VLEN，以 m8 寄存器组（v0-v7, v8-v15, v16-v23, v24-v31）为单位，
+  4 条 vle8.v / vse8.v 覆盖全部 32 个向量寄存器。每寄存器填入唯一可识别 pattern。
+
+测试点：
+
+  Test-1（同线程 yield 恢复）
+    主线程填满 32 个 vreg → sched_yield → 读回比对。
+    验证：同一线程主动让出 CPU 后，OS 能正确保存并恢复其向量上下文。
+
+  Test-A（新线程初始状态）
+    worker 线程启动后直接读出 vreg 值，与全零比对。
+    验证：新线程的向量寄存器被 OS 初始化为零，不会泄漏父线程数据。
+
+  Test-C（跨线程 yield 恢复）
+    worker 填入自己的 pattern → sched_yield → 读回比对。
+    验证：多线程并发使用向量单元时，OS 不会混淆不同线程的向量状态。
+
+  Test-3（跨线程隔离）
+    worker 退出后，主线程再次读出自己的 vreg，与最初写入的 pattern 比对。
+    验证：子线程对向量寄存器的修改不会污染父线程的上下文。
+
+结果：4 项全部 PASS，starry 的向量上下文切换（保存/恢复/初始化/隔离）正确。
+
+
+
+
+7.改造后的算子后端支持(x100 a100)后改了test,先跑cpufallback,然后设置亲和性` println!("k3_test: echo 1 > /proc/set_ai_thread");
+    fs::write("/proc/set_ai_thread", b"1\n").expect("failed to write /proc/set_ai_thread");
+
+    println!("k3_test: submitting A100 int8 matmul");
+    let a100_result = run_matmul(&channel, AiTargetHint::PREFER_A100, 43, "a100");
+    print_matrix("a100 result", &a100_result);
+    assert_eq!(a100_result, EXPECTED);
+`
+在a100上用a100的fallback跑. 因为a100的vlen 1024bit和x100的vlen 256bit不同.所以目前是二选一,待到后面我们再考虑情况来支持从a100->x100的调度和x100->a100的调度.
+root@starry:/root # ./k3_test2
+[ 54.964802 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 54.975779 8:58 starry_kernel::task::user:25] Enter user space: ip=0x6013d7ae, sp=0x3fffff570
+[ 55.191436 8:58 starry_kernel::pseudofs::dev::k3_airunner:157] k3_airunner: BUILD_CHANNEL ioctl reached, arg=0x3fffffa88
+[ 55.200681 8:58 starry_kernel::pseudofs::dev::k3_airunner:122] k3_airunner: sync kernel alias begin pid=58, kernel_va=0xffffffc000000000, map_size=0x11000
+[ 55.517869 8:58 starry_kernel::pseudofs::dev::k3_airunner:138] k3_airunner: sync kernel alias done pid=58, kernel_va=0xffffffc000000000, map_size=0x11000
+[ 55.529953 8:58 starry_kernel::pseudofs::dev::k3_airunner:308] k3_airunner: BUILD_CHANNEL keepalive pid=58, user_va=0x79000, size=0x10400, channels=2, kernel_va=0xffffffc000000000, kernel_map_size=0x11000
+[ 55.549393 8:58 starry_kernel::pseudofs::dev::k3_airunner:330] k3_airunner: BUILD_CHANNEL registered pid=58, va=0x79000, size=0x11000, pages=17
+k3_test: channel built, va=0x79000, size=0x10400
+k3_test: submitting CPU int8 mat[ 55.704168 8:58 starry_kernel::pseudofs::dev::k3_airunner:340] k3_airunner: SUBMIT_GRAPH ioctl reached, arg=0x3fffff400
+[ 55.713300 8:58 starry_kernel::pseudofs::dev::k3_airunner:357] k3_airunner: SUBMIT_GRAPH registered channel pid=58, user_va=0x79000, kernel_va=0xffffffc000000000, size=0x10400, kernel_map_size=0x11000, channels=2, pages=17
+[ 55.734309 8:58 starry_kernel::pseudofs::dev::k3_airunner:394] k3_airunner: SUBMIT_GRAPH channel 0 is_valid begin pid=58
+[ 55.746458 8:58 starry_kernel::pseudofs::dev::k3_airunner:400] k3_airunner: SUBMIT_GRAPH channel 0 ref acquired pid=58, ptr=0xffffffc000000000
+mul
+[ 55.767325 8:58 starry_kernel::pseudofs::dev::k3_airunner:405] k3_airunner: SUBMIT_GRAPH channel 0 is_valid done pid=58, valid=true
+[ 55.777494 8:58 starry_kernel::pseudofs::dev::k3_airunner:394] k3_airunner: SUBMIT_GRAPH channel 1 is_valid begin pid=58
+[ 55.789645 8:58 starry_kernel::pseudofs::dev::k3_airunner:400] k3_airunner: SUBMIT_GRAPH channel 1 ref acquired pid=58, ptr=0xffffffc000008200
+[ 55.803707 8:58 starry_kernel::pseudofs::dev::k3_airunner:405] k3_airunner: SUBMIT_GRAPH channel 1 is_valid done pid=58, valid=true
+[ 55.816814 8:58 starry_kernel::pseudofs::dev::k3_airunner:418] k3_airunner: SUBMIT_GRAPH shared memory valid pid=58
+[ 55.830805 8:58 starry_kernel::pseudofs::dev::k3_airunner:421] k3_airunner: SUBMIT_GRAPH receiver channel 0 init begin pid=58
+[ 55.841122 8:58 starry_kernel::pseudofs::dev::k3_airunner:429] k3_airunner: SUBMIT_GRAPH receiver channel 0 init done pid=58
+[ 55.853620 8:58 starry_kernel::pseudofs::dev::k3_airunner:432] k3_airunner: SUBMIT_GRAPH sender channel 1 init begin pid=58
+[ 55.866035 8:58 starry_kernel::pseudofs::dev::k3_airunner:440] k3_airunner: SUBMIT_GRAPH sender channel 1 init done pid=58
+[ 55.878359 8:58 starry_kernel::pseudofs::dev::k3_airunner:441] k3_airunner: SUBMIT_GRAPH receiver channel 1 init begin pid=58
+[ 55.893223 8:58 starry_kernel::pseudofs::dev::k3_airunner:449] k3_airunner: SUBMIT_GRAPH receiver channel 1 init done pid=58
+[ 55.903455 8:58 starry_kernel::pseudofs::dev::k3_airunner:501] k3_airunner: SUBMIT_GRAPH graph_size usize conversion begin pid=58, graph_size=0x700
+[ 55.917943 8:58 starry_kernel::pseudofs::dev::k3_airunner:508] k3_airunner: SUBMIT_GRAPH graph_size usize conversion done pid=58, graph_size=0x700
+[ 55.932353 8:58 starry_kernel::pseudofs::dev::k3_airunner:513] k3_airunner: SUBMIT_GRAPH graph blob alloc begin pid=58, len=0x700
+[ 55.945289 8:58 starry_kernel::pseudofs::dev::k3_airunner:518] k3_airunner: SUBMIT_GRAPH graph blob alloc done pid=58, len=0x700
+[ 55.960404 8:58 starry_kernel::pseudofs::dev::k3_airunner:523] k3_airunner: SUBMIT_GRAPH copy graph blob begin pid=58, user_va=0x9040, len=0x700
+[ 55.972373 8:58 starry_kernel::pseudofs::dev::k3_airunner:533] k3_airunner: SUBMIT_GRAPH copy graph blob done pid=58, ok=true
+[ 55.984972 8:58 starry_kernel::pseudofs::dev::k3_airunner:552] I received the node:
+[ 55.993900 8:58 starry_kernel::pseudofs::dev::k3_airunner:553]   node_id: 0
+[ 56.002144 8:58 starry_kernel::pseudofs::dev::k3_airunner:554]   op: KernelOp(1)
+[ 56.013107 8:58 starry_kernel::pseudofs::dev::k3_airunner:555]   target_hint: AiTargetHint(1)
+[ 56.020636 8:58 starry_kernel::pseudofs::dev::k3_airunner:556]   input_count: 2, output_count: 1
+[ 56.030703 8:58 starry_kernel::pseudofs::dev::k3_airunner:564]   input[0]: dtype=AiDtype(3), ndim=2, shape=[4, 8]
+[ 56.042248 8:58 starry_kernel::pseudofs::dev::k3_airunner:564]   input[1]: dtype=AiDtype(3), ndim=2, shape=[8, 4]
+[ 56.053794 8:58 starry_kernel::pseudofs::dev::k3_airunner:576]   output[0]: dtype=AiDtype(5), ndim=2, shape=[4, 4]
+[ 56.067705 8:58 starry_kernel::pseudofs::dev::k3_airunner:122] k3_airunner: sync kernel alias begin pid=58, kernel_va=0xffffffc000011000, map_size=0x1000
+[ 56.382577 8:58 starry_kernel::pseudofs::dev::k3_airunner:138] k3_airunner: sync kernel alias done pid=58, kernel_va=0xffffffc000011000, map_size=0x1000
+[ 56.394570 8:58 starry_kernel::pseudofs::dev::k3_airunner:892] k3_airunner: map_user_to_kernel pid=58, user_va=0x6000, len=0x20, kernel_va=0xffffffc000011000, map_size=0x1000
+[ 56.411407 8:58 starry_kernel::pseudofs::dev::k3_airunner:614]   input[0] mapped: user_va=0x6000, size=0x20 -> kernel_va=0xffffffc000011000
+[ 56.425211 8:58 starry_kernel::pseudofs::dev::k3_airunner:122] k3_airunner: sync kernel alias begin pid=58, kernel_va=0xffffffc000012000, map_size=0x1000
+[ 56.742397 8:58 starry_kernel::pseudofs::dev::k3_airunner:138] k3_airunner: sync kernel alias done pid=58, kernel_va=0xffffffc000012000, map_size=0x1000
+[ 56.754396 8:58 starry_kernel::pseudofs::dev::k3_airunner:892] k3_airunner: map_user_to_kernel pid=58, user_va=0x7000, len=0x20, kernel_va=0xffffffc000012000, map_size=0x1000
+[ 56.771233 8:58 starry_kernel::pseudofs::dev::k3_airunner:614]   input[1] mapped: user_va=0x7000, size=0x20 -> kernel_va=0xffffffc000012000
+[ 56.785038 8:58 starry_kernel::pseudofs::dev::k3_airunner:122] k3_airunner: sync kernel alias begin pid=58, kernel_va=0xffffffc000013000, map_size=0x1000
+[ 57.102227 8:58 starry_kernel::pseudofs::dev::k3_airunner:138] k3_airunner: sync kernel alias done pid=58, kernel_va=0xffffffc000013000, map_size=0x1000
+[ 57.114221 8:58 starry_kernel::pseudofs::dev::k3_airunner:892] k3_airunner: map_user_to_kernel pid=58, user_va=0x8000, len=0x40, kernel_va=0xffffffc000013000, map_size=0x1000
+[ 57.131059 8:58 starry_kernel::pseudofs::dev::k3_airunner:654]   output[0] mapped: user_va=0x8000, size=0x40 -> kernel_va=0xffffffc000013000
+[ 57.144948 8:58 starry_kernel::pseudofs::dev::k3_airunner:670]   attr_size: 72 bytes
+[ 57.153976 8:58 starry_kernel::pseudofs::dev::k3_airunner:677] k3_airunner: scheduler run_graph begin pid=58, token=42
+[ 57.470529 8:58 k3_aiScheduler::scheduler:71] scheduler initialized, worker thread should be started
+[ 57.478007 8:58 starry_kernel::pseudofs::dev::k3_airunner:692] k3_airunner: scheduler run_graph done pid=58, token=42
+[ 57.489896 8:58 starry_kernel::pseudofs::dev::k3_airunner:697] k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid=58, token=42, graph_va=0x9040, graph_size=0x700
+[ 58.112877 10:59 starry_kernel::pseudofs::dev::k3_airunner:731] k3_airunner: scheduler worker affinity target_cpu=10, set=true
+[ 58.122612 10:59 k3_aiScheduler::scheduler:105] run node: node_id=0, op=KernelOp(1)
+[ 58.131557 10:59 k3_kernel_backend:111] k3_run_kernel: node_id=0, op=KernelOp(1), target_hint=1
+[ 58.435818 10:59 k3_kernel_backend::matmul:268] run int8 matmul in cpu
+[ 58.440694 10:59 k3_aiScheduler::scheduler:115] k3_run_kernel success: node_id=0, op=KernelOp(1)
+[ 58.450765 10:59 k3_aiScheduler::scheduler:129] task completed, token=42
+cpu result (4x4):
+  [   140   168   196   224 ]
+  [   168   204   240   284 ]
+  [   196   240   284   344 ]
+  [   252   312   372   464 ]
+k3_test: echo 1 > /proc/[ 58.478867 8:58 starry_kernel::pseudofs::dev::k3_airunner:340] k3_airunner: SUBMIT_GRAPH ioctl reached, arg=0x3fffff400
+[ 58.490826 8:58 starry_kernel::pseudofs::dev::k3_airunner:357] k3_airunner: SUBMIT_GRAPH registered channel pid=58, user_va=0x79000, kernel_va=0xffffffc000000000, size=0x10400, kernel_map_size=0x11000, channels=2, pages=17
+set_ai_thread
+k3_test: submitting A100 int8 matmul
+[ 58.520669 8:58 starry_kernel::pseudofs::dev::k3_airunner:394] k3_airunner: SUBMIT_GRAPH channel 0 is_valid begin pid=58
+[ 58.529959 8:58 starry_kernel::pseudofs::dev::k3_airunner:400] k3_airunner: SUBMIT_GRAPH channel 0 ref acquired pid=58, ptr=0xffffffc000000000
+[ 58.544021 8:58 starry_kernel::pseudofs::dev::k3_airunner:405] k3_airunner: SUBMIT_GRAPH channel 0 is_valid done pid=58, valid=true
+[ 58.557127 8:58 starry_kernel::pseudofs::dev::k3_airunner:394] k3_airunner: SUBMIT_GRAPH channel 1 is_valid begin pid=58
+[ 58.569280 8:58 starry_kernel::pseudofs::dev::k3_airunner:400] k3_airunner: SUBMIT_GRAPH channel 1 ref acquired pid=58, ptr=0xffffffc000008200
+[ 58.590386 8:58 starry_kernel::pseudofs::dev::k3_airunner:405] k3_airunner: SUBMIT_GRAPH channel 1 is_valid done pid=58, valid=true
+[ 58.600558 8:58 starry_kernel::pseudofs::dev::k3_airunner:418] k3_airunner: SUBMIT_GRAPH shared memory valid pid=58
+[ 58.612274 8:58 starry_kernel::pseudofs::dev::k3_airunner:421] k3_airunner: SUBMIT_GRAPH receiver channel 0 init begin pid=58
+[ 58.624861 8:58 starry_kernel::pseudofs::dev::k3_airunner:429] k3_airunner: SUBMIT_GRAPH receiver channel 0 init done pid=58
+[ 58.637361 8:58 starry_kernel::pseudofs::dev::k3_airunner:432] k3_airunner: SUBMIT_GRAPH sender channel 1 init begin pid=58
+[ 58.652046 8:58 starry_kernel::pseudofs::dev::k3_airunner:440] k3_airunner: SUBMIT_GRAPH sender channel 1 init done pid=58
+[ 58.662103 8:58 starry_kernel::pseudofs::dev::k3_airunner:441] k3_airunner: SUBMIT_GRAPH receiver channel 1 init begin pid=58
+[ 58.674687 8:58 starry_kernel::pseudofs::dev::k3_airunner:449] k3_airunner: SUBMIT_GRAPH receiver channel 1 init done pid=58
+[ 58.687190 8:58 starry_kernel::pseudofs::dev::k3_airunner:501] k3_airunner: SUBMIT_GRAPH graph_size usize conversion begin pid=58, graph_size=0x700
+[ 58.701684 8:58 starry_kernel::pseudofs::dev::k3_airunner:508] k3_airunner: SUBMIT_GRAPH graph_size usize conversion done pid=58, graph_size=0x700
+[ 58.718376 8:58 starry_kernel::pseudofs::dev::k3_airunner:513] k3_airunner: SUBMIT_GRAPH graph blob alloc begin pid=58, len=0x700
+[ 58.729033 8:58 starry_kernel::pseudofs::dev::k3_airunner:518] k3_airunner: SUBMIT_GRAPH graph blob alloc done pid=58, len=0x700
+[ 58.741875 8:58 starry_kernel::pseudofs::dev::k3_airunner:523] k3_airunner: SUBMIT_GRAPH copy graph blob begin pid=58, user_va=0x9050, len=0x700
+[ 58.756112 8:58 starry_kernel::pseudofs::dev::k3_airunner:533] k3_airunner: SUBMIT_GRAPH copy graph blob done pid=58, ok=true
+[ 58.768710 8:58 starry_kernel::pseudofs::dev::k3_airunner:552] I received the node:
+[ 58.777637 8:58 starry_kernel::pseudofs::dev::k3_airunner:553]   node_id: 0
+[ 58.788157 8:58 starry_kernel::pseudofs::dev::k3_airunner:554]   op: KernelOp(1)
+[ 58.794568 8:58 starry_kernel::pseudofs::dev::k3_airunner:555]   target_hint: AiTargetHint(3)
+[ 58.804375 8:58 starry_kernel::pseudofs::dev::k3_airunner:556]   input_count: 2, output_count: 1
+[ 58.814444 8:58 starry_kernel::pseudofs::dev::k3_airunner:564]   input[0]: dtype=AiDtype(3), ndim=2, shape=[4, 8]
+[ 58.825992 8:58 starry_kernel::pseudofs::dev::k3_airunner:564]   input[1]: dtype=AiDtype(3), ndim=2, shape=[8, 4]
+[ 58.839814 8:58 starry_kernel::pseudofs::dev::k3_airunner:576]   output[0]: dtype=AiDtype(5), ndim=2, shape=[4, 4]
+[ 58.849173 8:58 starry_kernel::pseudofs::dev::k3_airunner:122] k3_airunner: sync kernel alias begin pid=58, kernel_va=0xffffffc000014000, map_size=0x1000
+[ 59.166309 8:58 starry_kernel::pseudofs::dev::k3_airunner:138] k3_airunner: sync kernel alias done pid=58, kernel_va=0xffffffc000014000, map_size=0x1000
+[ 59.178302 8:58 starry_kernel::pseudofs::dev::k3_airunner:892] k3_airunner: map_user_to_kernel pid=58, user_va=0x6000, len=0x20, kernel_va=0xffffffc000014000, map_size=0x1000
+[ 59.195139 8:58 starry_kernel::pseudofs::dev::k3_airunner:614]   input[0] mapped: user_va=0x6000, size=0x20 -> kernel_va=0xffffffc000014000
+[ 59.208944 8:58 starry_kernel::pseudofs::dev::k3_airunner:122] k3_airunner: sync kernel alias begin pid=58, kernel_va=0xffffffc000015000, map_size=0x1000
+[ 59.526036 8:58 starry_kernel::pseudofs::dev::k3_airunner:138] k3_airunner: sync kernel alias done pid=58, kernel_va=0xffffffc000015000, map_size=0x1000
+[ 59.538032 8:58 starry_kernel::pseudofs::dev::k3_airunner:892] k3_airunner: map_user_to_kernel pid=58, user_va=0x7000, len=0x20, kernel_va=0xffffffc000015000, map_size=0x1000
+[ 59.554870 8:58 starry_kernel::pseudofs::dev::k3_airunner:614]   input[1] mapped: user_va=0x7000, size=0x20 -> kernel_va=0xffffffc000015000
+[ 59.568675 8:58 starry_kernel::pseudofs::dev::k3_airunner:122] k3_airunner: sync kernel alias begin pid=58, kernel_va=0xffffffc000016000, map_size=0x1000
+[ 59.885811 8:58 starry_kernel::pseudofs::dev::k3_airunner:138] k3_airunner: sync kernel alias done pid=58, kernel_va=0xffffffc000016000, map_size=0x1000
+[ 59.897807 8:58 starry_kernel::pseudofs::dev::k3_airunner:892] k3_airunner: map_user_to_kernel pid=58, user_va=0x8000, len=0x40, kernel_va=0xffffffc000016000, map_size=0x1000
+[ 59.914644 8:58 starry_kernel::pseudofs::dev::k3_airunner:654]   output[0] mapped: user_va=0x8000, size=0x40 -> kernel_va=0xffffffc000016000
+[ 59.928533 8:58 starry_kernel::pseudofs::dev::k3_airunner:670]   attr_size: 72 bytes
+[ 59.937559 8:58 starry_kernel::pseudofs::dev::k3_airunner:677] k3_airunner: scheduler run_graph begin pid=58, token=43
+[ 59.949541 8:58 starry_kernel::pseudofs::dev::k3_airunner:692] k3_airunner: scheduler run_graph done pid=58, token=43
+[ 59.949542 10:59 k3_aiScheduler::scheduler:105] run node: node_id=0, op=KernelOp(1)
+[ 59.963703 8:58 starry_kernel::pseudofs::dev::k3_airunner:697] k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid=58, token=43, graph_va=0x9050, graph_size=0x700
+[ 59.970375 10:59 k3_kernel_backend:111] k3_run_kernel: node_id=0, op=KernelOp(1), target_hint=3
+[ 59.996328 10:59 k3_kernel_backend::matmul:186] run int8 matmul on A100 IME, tile=4x8x4 (M x K x N)
+[ 60.006660 10:59 k3_aiScheduler::scheduler:115] k3_run_kernel success: node_id=0, op=KernelOp(1)
+[ 60.016736 10:59 k3_aiScheduler::scheduler:129] task completed, token=43
+a100 result (4x4):
+  [   140   168   196   224 ]
+  [   168   204   240   284 ]
+[ 60.031922 8:58 starry_kernel::task::ops:534] Task(58, "k3_test2") exit with code: 0
+  [   196   240   284   344 ]
+  [   252   312   372   464 ]
+k3_test: CPU and A100 matmul both matched expected output
+[ 60.056789 8:58 starry_kernel::task::signal:561] Send signal SIGCHLD to process 1
+[ 60.062954 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WUNTRACED)
+[ 60.074274 8:42 starry_kernel::syscall::task::wait:238] sys_waitpid <= pid: -1, options: WaitPidOptions(WNOHANG | WUNTRACED)
+
+
+
+
+重要的进展: 1.starryos成功上板. 为此我做的努力. ufs驱动实现.    实现过程:在spacemit仓库翻出了他们linux版本的实现.然后使用bindgen生成寄存器配置(保证不会抄错,这里为了快捷没有选用svd2rust,当然这个更好),然后使用c2rust将部分c文件进行翻译.最后对翻译的文件进行特定修改,再写上胶水代码.   这期间我遇到的问题:   dma空壳实现,在starryos上有dma内存同步的接口,但是实现为空. 我已经完全按照c版本的驱动来但是还是在ufs启动时出错,我在调用前进行error检查内存内容发现了这个dma缓存没有同步的错误
+
+pax串口驱动的实现
+
+
+2.vevtor向量扩展的支持.我阅读了riscv指令手册了解了要保存的寄存器范围为32个vgpr+7个csr控制寄存器+1个vssattus寄存器.
+
+实现过程: 在任务上下文建立结构体保存.这里需要考虑是否是栈保存,因为v状态很大 在k3板子上的vgpr就有32*1024 bit大小,但是发现是堆内存动态分配所以无需担心
+
+测试: 我写了不同线程都使用向量扩展时是否能确保向量寄存器正确保存与恢复.编写完成之后先用qemu-riscv64进行测试,确保我程序实现没错.但是发现一个问题就是qemu他在新建线程时不会把向量寄存器给清空. 但是我们做了,
+到这里确保了程序的正确.然后我们使用qemu-system-riscv64跑os也正确验证
+
+然后是最终上板验证,也同样通过.
+
+
+然后是额外的测试,我下载了llama.cpp使用静态链接编译+v向量扩展出产物,还有一版不带v扩展的.结果是qemu和板子都能跑带v扩展的,模型是sjfalken/openai-gpt2-124M-F16-gguf的q2量化. 不带v也能跑.但是在qemu上带v反而是负优化,因为是模拟,而且在qemu上会导致降智(彩蛋吧算是).
+然后这里有个坑,在qemu上如果llama_cli不带-t 1.并且开启了smp多核.运行速度会呈现指数下降,后来分析原因发现是qemu在大量做原子同步操作,导致性能急剧下降
+在板子上不会
+
+
+
+3.k3的专属ime指令接入我的算子后端库.目前只支持matmul.这期间发现了形状与文档不符合(通过错误数值推导).
+
+
+
+4. cpu亲和性的设置.在k3上是通过/proc/set_ai_thread这个接口来设置线程是不是ai线程,使用echo 1 > /proc/set_ai_thread把自己立刻调度到ai核心(在我的k3芯片上是core 8-15)范围内调度.以确保使用正确的vlen和专属的ai加速
+
+
+
+5. llama.cpp后端搭建bridge跑fp16的openai-gpt2-124M-F16.gguf
+
+目标:
+  先不做完整的ggml新后端,而是在llama.cpp现有CPU后端里加一个实验性fast path.
+  只要遇到满足条件的MUL_MAT节点,就尝试把这个matmul提交到StarryOS的/dev/k3_airunner.
+  如果任何条件不满足,或者/dev/k3_airunner不可用,就直接回退到llama.cpp原来的CPU路径.
+
+为什么先选openai-gpt2-124M-F16.gguf:
+  一开始考虑过tinyllama-15M-stories-Q2_K.gguf,但是Q2_K量化会涉及ggml量化块解包、scale/min等逻辑,
+  这会把第一阶段问题扩大成"量化格式lowering + 后端接入 + 内核运行时调度".
+  所以第一阶段改成F16 GPT-2,这样核心问题简化成:
+    ggml的F16/F32输入 -> 转成F32共享tensor -> k3_airunner提交F32 matmul -> 输出回写ggml dst.
+
+接入位置:
+  llama.cpp:
+    /home/inkbottle/othersrc/llama.cpp/ggml/CMakeLists.txt
+      新增GGML_K3_AIRUNNER开关.
+
+    /home/inkbottle/othersrc/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt
+      当GGML_K3_AIRUNNER=ON时,编译ggml-cpu/k3-airunner.c,
+      并通过cargo build生成Rust staticlib:
+        /home/inkbottle/othersrc/k3x-HERA-RT/k3_ggml_bridge/target/.../libk3_ggml_bridge.a
+
+    /home/inkbottle/othersrc/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c
+      在ggml_compute_forward_mul_mat()进入原CPU matmul之前尝试:
+        ggml_cpu_k3_airunner_try_mul_mat(dst)
+      只有线程0真正提交K3任务,其他线程在barrier等待结果.
+
+    /home/inkbottle/othersrc/llama.cpp/ggml/src/ggml-cpu/k3-airunner.c
+      C侧shim,负责识别当前ggml tensor是否可支持,然后调用Rust FFI:
+        k3_ggml_matmul_f32()
+
+  k3x-HERA-RT:
+    /home/inkbottle/othersrc/k3x-HERA-RT/k3_ggml_bridge
+      新增Rust bridge crate,crate-type同时提供staticlib和cdylib.
+
+思路:
+  1. 不直接把ggml malloc出来的tensor指针交给内核.
+     因为当前StarryOS的k3_airunner内核实现只接受MAP_SHARED用户内存,
+     map_user_to_kernel会检查用户VMA是否来自shared backend.
+     llama.cpp自己的内存不是这个来源,所以直接传一定会失败.
+
+  2. bridge内部重新分配k3_aiRuntime::Tensor.
+     TensorManager::alloc_tensor()底层使用MAP_SHARED匿名mmap,
+     这样内核可以把这块用户态共享内存映射成kernel alias.
+     C侧只负责把ggml src0/src1拷贝成连续F32 buffer;
+     Rust bridge再把这些F32数据拷贝到共享tensor中.
+
+  3. 第一阶段只支持最小集合:
+       src0 type: F16或F32
+       src1 type: F16或F32
+       dst  type: F32
+       tensor必须是2D
+       src0/src1第0维必须是dense row
+     不满足就return 0,让ggml原CPU路径继续跑.
+
+  4. ggml MUL_MAT的维度语义要非常小心.
+     ggml_mul_mat(a, b)的结果维度是:
+       dst.ne[0] = a.ne[1]
+       dst.ne[1] = b.ne[1]
+     CPU实现里实际等价于:
+       dst[col_of_b, row_of_a] = dot(a[row_of_a], b[col_of_b])
+     对K3 matmul attr来说可以整理成:
+       lhs = src0, shape m x k
+       rhs = src1, shape n x k, 作为rhs_transposed输入
+       out = m x n
+     这里踩了一个坑: ggml的dst第0维连续,所以K3输出stride必须是:
+       out_row_stride = 1
+       out_col_stride = dst->nb[1] / sizeof(float)
+     不能按普通C row-major写成out_row_stride=n,out_col_stride=1,
+     否则结果会按另一种二维布局写回.
+
+  5. target_hint先使用PREFER_CPU.
+     当前k3_kernel_backend里的F32 matmul只支持CPU fallback.
+     A100/X100路径现在主要是int8->i32 IME matmul.
+     所以F16 GPT-2这条链路现阶段的意义是:
+       llama.cpp -> ggml hook -> k3_airunner ABI -> scheduler -> kernel backend
+     先把整条软件通路打通,后面再把F32/FP16算子替换成A100可执行实现.
+
+编译与验证:
+  host验证:
+    cmake -S /home/inkbottle/othersrc/llama.cpp \
+      -B /home/inkbottle/othersrc/llama.cpp/build-k3-host-cli \
+      -DGGML_K3_AIRUNNER=ON \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_TOOLS=ON \
+      -DLLAMA_BUILD_SERVER=ON \
+      -DLLAMA_BUILD_APP=OFF \
+      -DLLAMA_BUILD_UI=OFF
+
+    cmake --build /home/inkbottle/othersrc/llama.cpp/build-k3-host-cli \
+      --target llama-cli -j$(nproc)
+
+  riscv64 musl交叉编译:
+    rustup target add riscv64gc-unknown-linux-musl
+
+    cmake -S /home/inkbottle/othersrc/llama.cpp \
+      -B /home/inkbottle/othersrc/llama.cpp/build-k3-riscv64 \
+      -DCMAKE_TOOLCHAIN_FILE=/home/inkbottle/othersrc/llama.cpp/cmake/riscv64-unknown-linux-musl-gcc.cmake \
+      -DGGML_K3_AIRUNNER=ON \
+      -DGGML_K3_AIRUNNER_RUST_TARGET=riscv64gc-unknown-linux-musl \
+      -DGGML_K3_AIRUNNER_RUST_LINKER=/home/inkbottle/.local/riscv-musl/bin/riscv64-unknown-linux-musl-gcc \
+      -DGGML_OPENMP=OFF \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_TOOLS=ON \
+      -DLLAMA_BUILD_SERVER=ON \
+      -DLLAMA_BUILD_APP=OFF \
+      -DLLAMA_BUILD_UI=OFF
+
+    cmake --build /home/inkbottle/othersrc/llama.cpp/build-k3-riscv64 \
+      --target llama-cli -j$(nproc)
+
+  这里有一个交叉编译坑:
+    llama.cpp默认会找到OpenMP并链接libgomp.
+    但当前riscv64 musl工具链的libgomp是动态库,而toolchain文件强制-static,
+    最终会报:
+      attempted static link of dynamic object libgomp.so
+    解决方式是板子版构建加-DGGML_OPENMP=OFF.
+    我们现在本来就是先用-t 1跑最小GPT-2,不依赖OpenMP.
+
+当前结果:
+  host llama-cli 构建通过.
+  riscv64 musl llama-cli 构建通过.
+
+  产物:
+    /home/inkbottle/othersrc/llama.cpp/build-k3-riscv64/bin/llama-cli
+
+  file检查:
+    ELF 64-bit LSB executable, UCB RISC-V, RVC, double-float ABI, statically linked
+
+  readelf检查:
+    There is no dynamic section in this file.
+
+  nm检查确认K3 bridge符号已进入最终二进制:
+    ggml_cpu_k3_airunner_try_mul_mat
+    k3_ggml_matmul_f32
+
+上板运行建议:
+  /root/llama-cli -m /root/openai-gpt2-124M-F16.gguf -p "Once upon a time" -n 32 -t 1
+
+当前限制:
+  1. 只支持GGML_OP_MUL_MAT中的2D F16/F32 -> F32.
+  2. 不支持Q2_K等量化模型的直接offload.
+  3. 目前F32 matmul进k3 backend后仍然走CPU fallback,不是A100真正加速.
+  4. 每次offload有两次拷贝: ggml tensor -> C侧F32临时buffer -> MAP_SHARED tensor.
+     这会慢,但它先验证了ABI和调度链路.
+
+后续路线:
+  1. 先在板子上用GPT-2 F16确认能完整跑通.
+  2. 给bridge加统计日志,确认实际命中了多少个MUL_MAT.
+  3. 把F32/FP16 matmul真正下沉到A100/X100可执行路径.
+  4. 再考虑Q2_K/Q4_K等量化格式的lowering,把量化权重直接转成IME友好的int8 tile格式.

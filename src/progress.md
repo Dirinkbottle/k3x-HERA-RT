@@ -12,10 +12,10 @@
 | [*] 纯线程内核执行路径 | 完成纯线程调度器、核心队列、worker、buffer pin/map/cache 最小路径（3 天） |
 | [*] completion 回到用户态 | job/node/graph 完成后能通知用户态等待方（2 天） |
 | [*] CPU fallback MatMul | 用 CPU fallback 跑通 MatMul 正确性（2 天） |
-| [ ] A100/X100 IME probe | 验证 A100/X100 IME backend 的最小执行与结果正确性（2 天） |
+| [*] A100/X100 IME probe | 验证 A100/X100 IME backend 的最小执行与结果正确性（2 天） |
+| [*] 计划外平台侧适配与驱动补齐 | 原先预期 K3 平台侧适配已有其他人接手，但实际推进中需要临时补齐真板启动、驱动和 V 扩展上下文支持，明显占用了阶段一时间 |
 | [ ] ggml `mul_mat` 接入 | llama.cpp 的核心矩阵乘法能走用户态算子库（5 天） |
 | [ ] llama.cpp 文本生成跑通 | 改造后的 ggml backend 能跑通一个文本生成模型（5 天） |
-| [ ] 阶段一比赛演示视频与性能文档 | 展示 LLM、YOLO 等模型在 K3 芯片上正常运行，展示单核心执行下的算力限制，并记录性能基线（3 天） |
 
 ### 阶段一子任务拆分
 
@@ -33,26 +33,46 @@
   - [x] completion ring entry
   - [x] token 匹配与错误码返回
   - [x] 用户态等待/唤醒 API
-- [ ] CPU fallback MatMul（2 天）
+- [*] CPU fallback MatMul（2 天）
   - [x] CPU fallback MatMul 实现
-  - [ ] MatMul golden case 对比
+  - [*] MatMul golden case 对比
 - [ ] A100/X100 IME probe（2 天）
-  - [ ] 使用官方支持文档和工具链编写最小 IME probe
-  - [ ] 验证 A100/X100 IME 执行结果正确性
+  - [*] 使用官方支持文档和工具链编写最小 IME probe
+  - [*] 验证 A100/X100 IME 执行结果正确性
+- [x] 计划外平台侧适配与驱动补齐
+  - [x] K3 真板启动路径和 rootfs/UFS 启动验证
+  - [x] UFS 驱动迁移和调试
+  - [x] RISC-V DMA cache 同步问题定位与补齐
+  - [x] `/proc/set_ai_thread` AI 线程控制接口
+  - [x] RISC-V V 扩展上下文保存恢复
+  - [x] V 扩展同线程、跨线程和真板测试
 - [ ] ggml `mul_mat` 接入（5 天）
-  - [ ] 找到 ggml `mul_mat` backend 接入点
-  - [ ] 将 ggml tensor 转换为阶段一 UAPI
-  - [ ] 接入用户态算子库和 ring submit
+  - [-] 找到 ggml `mul_mat` backend 接入点
+  - [x] 加入 `k3_ggml_bridge` 测试版，用 C ABI 接收 F32 MatMul 请求
+  - [x] 将测试版 F32 MatMul 请求转换为阶段一 UAPI graph
+  - [x] 接入用户态算子库和 graph submit 测试路径
+  - [-] 接入真实 ggml backend
+  - [ ] 补充 dtype/layout/quant 支持
   - [ ] 对比 ggml CPU fallback 输出
 - [ ] llama.cpp 文本生成跑通（5 天）
-  - [ ] 固定模型、prompt 和运行参数
+  - [X] 固定模型、prompt 和运行参数
   - [ ] 跑通文本生成
   - [ ] 记录 tokens/s、latency 和错误日志
-- [ ] 阶段一比赛演示视频与性能文档（3 天）
-  - [ ] 录制 LLM 推理演示
-  - [ ] 录制 YOLO 推理演示
-  - [ ] 展示单核心执行下的算力限制
-  - [ ] 整理阶段一性能对比文档
+
+## 阶段一计划外插入：平台侧适配与驱动补齐
+
+阶段一原本主要计划推进 AI runtime、UAPI、调度器和 backend 闭环。当时预期 K3 平台侧适配、真板启动和基础驱动已有其他人接手，因此这些工作没有放进最初的 AI runtime 开发估算里。
+
+实际推进过程中发现，要验证 K3/K3x AI 算力调度，必须先让 StarryOS 能稳定在 K3 真板上启动，并且要补齐 IME 指令依赖的底层系统能力。这部分成为计划外插入项，耗时明显超出最初预期，主要包括：
+
+- K3 真板启动和 UFS rootfs 路径。
+- UFS 驱动迁移、初始化序列调试和真板验证。
+- StarryOS RISC-V DMA cache 同步空实现的定位与补齐。
+- `/proc/set_ai_thread` AI 线程控制接口和核心亲和性验证。
+- RISC-V V 扩展上下文保存恢复。
+- V 扩展同线程 yield、跨线程隔离和 K3 真板测试。
+
+这部分工作虽然打乱了阶段一原先节奏，但它是后续 A100/X100 IME backend、AI 线程调度和真实硬件测试的前置条件。如果没有这些平台侧基础，AI runtime 只能在 QEMU 或用户态模拟路径中验证，无法证明 K3 真板上的 AI 算力调度链路。
 
 ## 阶段二：内核调度器 async 化与多核心简单调度
 
