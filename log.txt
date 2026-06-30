@@ -1,0 +1,218 @@
+root@starry:/root # ./k3_test 
+[ 16.574255 3:35 starry_kernel::pseudofs::dev::k3_airunner:82] k3_airunner: BUILD_CHANNEL ioctl reached, arg=0x3ffffdce0
+[ 16.574891 3:35 starry_kernel::pseudofs::dev::k3_airunner:224] k3_airunner: BUILD_CHANNEL keepalive pid=35, user_va=0x78000, size=0x10400, channels=2, kernel_va=0xffffffc000044000, kernel_map_size=0x11000
+[ 16.575475 3:35 starry_kernel::pseudofs::dev::k3_airunner:246] k3_airunner: BUILD_CHANNEL registered pid=35, va=0x78000, size=0x11000, pages=17
+k3_test: channel built, va=0x78000, size=0x10400
+k3_test: submitting graph with 2 matmul nodes
+[ 16.580826 3:35 starry_kernel::pseudofs::dev::k3_airunner:256] k3_airunner: SUBMIT_GRAPH ioctl reached, arg=0x3fffff5c0
+
+//这里目前硬编码core3,然后跑shcduler成功解析图并且打印出节点和op类型
+[ 16.581258 3:35 k3_aiScheduler::scheduler:59] node_id=0, kernel_op=KernelOp(1)
+[ 16.581515 3:35 k3_aiScheduler::scheduler:59] node_id=1, kernel_op=KernelOp(1)
+// submit 结束
+[ 16.581777 3:35 starry_kernel::pseudofs::dev::k3_airunner:360] k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid=35, token=0, graph_va=0x8060, graph_size=0xd48
+
+// test 结束
+k3_test: graph submitted successfully
+root@starry:/root # exit
+
+
+
+
+
+
+
+root@starry:/root # ./k3_test 
+[331.961011 2:39 starry_kernel::pseudofs::dev::k3_airunner:124] k3_airunner: BUILD_CHANNEL ioctl reached, arg=0x3ffffe3d8
+[331.961584 2:39 starry_kernel::pseudofs::dev::k3_airunner:266] k3_airunner: BUILD_CHANNEL keepalive pid=39, user_va=0x7c000, size=0x10400, channels=2, kernel_va=0xffffffc000050000, kernel_map_size=0x11000
+[331.962214 2:39 starry_kernel::pseudofs::dev::k3_airunner:288] k3_airunner: BUILD_CHANNEL registered pid=39, va=0x7c000, size=0x11000, pages=17
+k3_test: channel built, va=0x7c000, size=0x10400
+k3_test: submitting 2×5 matmul
+[331.971557 2:39 starry_kernel::pseudofs::dev::k3_airunner:298] k3_airunner: SUBMIT_GRAPH ioctl reached, arg=0x3fffff540
+[331.972022 2:39 starry_kernel::pseudofs::dev::k3_airunner:426] I received the node:
+[331.972286 2:39 starry_kernel::pseudofs::dev::k3_airunner:427]   node_id: 0
+[331.972529 2:39 starry_kernel::pseudofs::dev::k3_airunner:428]   op: KernelOp(1)
+[331.972791 2:39 starry_kernel::pseudofs::dev::k3_airunner:429]   target_hint: AiTargetHint(1)
+[331.973251 2:39 starry_kernel::pseudofs::dev::k3_airunner:430]   input_count: 2, output_count: 1
+[331.973562 2:39 starry_kernel::pseudofs::dev::k3_airunner:435]   input[0]: dtype=AiDtype(0), ndim=2, shape=[2, 3]
+[331.973963 2:39 starry_kernel::pseudofs::dev::k3_airunner:435]   input[1]: dtype=AiDtype(0), ndim=2, shape=[3, 5]
+[331.974312 2:39 starry_kernel::pseudofs::dev::k3_airunner:442]   output[0]: dtype=AiDtype(0), ndim=2, shape=[2, 5]
+[331.974756 2:39 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=39, user_va=0x6000, len=0x18, kernel_va=0xffffffc000061000, map_size=0x1000
+[331.975311 2:39 starry_kernel::pseudofs::dev::k3_airunner:468]   input[0] mapped: user_va=0x6000, size=0x18 -> kernel_va=0xffffffc000061000
+[331.975816 2:39 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=39, user_va=0x7000, len=0x3c, kernel_va=0xffffffc000062000, map_size=0x1000
+[331.976338 2:39 starry_kernel::pseudofs::dev::k3_airunner:468]   input[1] mapped: user_va=0x7000, size=0x3c -> kernel_va=0xffffffc000062000
+[331.976887 2:39 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=39, user_va=0x8000, len=0x28, kernel_va=0xffffffc000063000, map_size=0x1000
+[331.977400 2:39 starry_kernel::pseudofs::dev::k3_airunner:495]   output[0] mapped: user_va=0x8000, size=0x28 -> kernel_va=0xffffffc000063000
+[331.977785 2:39 starry_kernel::pseudofs::dev::k3_airunner:506]   attr_size: 72 bytes
+[331.978257 2:39 starry_kernel::pseudofs::dev::k3_airunner:528] k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid=39, token=13, graph_va=0x9040, graph_size=0x700
+[331.978278 3:33 k3_aiScheduler::sck3_test: graph submitted successfully
+heduler:102] run node: node_id=0, op=KernelOp(1)
+[331.979191 3:33 k3_kernel_backend:107] k3_run_kernel: node_id=0, op=KernelOp(1), target_hint=1
+[331.979534 3:33 k3_kernel_backend::matmul:108] run mutmal in cpu
+[331.979788 3:33 k3_kernel_backend::matmul:146] [kernel backend matmul: log]:
+[331.980079 3:33 k3_kernel_backend::matmul:147]   shape: 2x3 @ 3x5 -> 2x5
+[331.980361 3:33 k3_kernel_backend::matmul:148]   batch: 1
+[331.980582 3:33 k3_kernel_backend::matmul:151]   cpu matmul output (2x5):
+[331.980895 3:33 k3_kernel_backend::matmul:159]     [ 1.0 2.0 3.0 0.0 0.0 ]
+[331.981188 3:33 k3_kernel_backend::matmul:159]     [ 4.0 5.0 6.0 0.0 0.0 ]
+[331.981485 3:33 k3_aiScheduler::scheduler:109] k3_run_kernel success: node_id=0, op=KernelOp(1)
+[331.981810 3:33 k3_aiScheduler::scheduler:117] task completed, token=13
+comple task ,token:13
+result (2×5):
+  [   1.0   2.0   3.0   0.0   0.0 ]
+  [   4.0   5.0   6.0   0.0   0.0 ]
+expected (2×5):
+  [   1.0   2.0   3.0   0.0   0.0 ]
+  [   4.0   5.0   6.0   0.0   0.0 ]
+verification: 10/10 elements match
+continue , current avoid kernel access user addr
+^C
+root@starry:/root # exit
+
+✓ 已退出串口终端模式
+
+
+
+
+
+root@starry:/root # ./k3_test 
+[ 54.549741 0:36 starry_kernel::pseudofs::dev::k3_airunner:124] k3_airunner: BUILD_CHANNEL ioctl reached, arg=0x3ffffe698
+[ 54.550405 0:36 starry_kernel::pseudofs::dev::k3_airunner:266] k3_airunner: BUILD_CHANNEL keepalive pid=36, user_va=0x7d000, size=0x10400, channels=2, kernel_va=0xffffffc000014000, kernel_map_size=0x11000
+[ 54.551003 0:36 starry_kernel::pseudofs::dev::k3_airunner:288] k3_airunner: BUILD_CHANNEL registered pid=36, va=0x7d000, size=0x11000, pages=17
+k3_test: channel built, va=0x7d000, size=0x10400
+k3_test: submitting DAG graph (a || b) -> d
+[ 54.560925 0:36 starry_kernel::pseudofs::dev::k3_airunner:298] k3_airunner: SUBMIT_GRAPH ioctl reached, arg=0x3fffff540
+[ 54.561566 0:36 starry_kernel::pseudofs::dev::k3_airunner:426] I received the node:
+[ 54.561824 0:36 starry_kernel::pseudofs::dev::k3_airunner:427]   node_id: 0
+[ 54.562058 0:36 starry_kernel::pseudofs::dev::k3_airunner:428]   op: KernelOp(1)
+[ 54.562333 0:36 starry_kernel::pseudofs::dev::k3_airunner:429]   target_hint: AiTargetHint(1)
+[ 54.562641 0:36 starry_kernel::pseudofs::dev::k3_airunner:430]   input_count: 2, output_count: 1
+[ 54.562925 0:36 starry_kernel::pseudofs::dev::k3_airunner:435]   input[0]: dtype=AiDtype(0), ndim=2, shape=[2, 3]
+[ 54.563304 0:36 starry_kernel::pseudofs::dev::k3_airunner:435]   input[1]: dtype=AiDtype(0), ndim=2, shape=[3, 2]
+[ 54.563692 0:36 starry_kernel::pseudofs::dev::k3_airunner:442]   output[0]: dtype=AiDtype(0), ndim=2, shape=[2, 2]
+[ 54.564139 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0x6000, len=0x18, kernel_va=0xffffffc000025000, map_size=0x1000
+[ 54.564628 0:36 starry_kernel::pseudofs::dev::k3_airunner:468]   input[0] mapped: user_va=0x6000, size=0x18 -> kernel_va=0xffffffc000025000
+[ 54.565120 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0x7000, len=0x18, kernel_va=0xffffffc000026000, map_size=0x1000
+[ 54.565608 0:36 starry_kernel::pseudofs::dev::k3_airunner:468]   input[1] mapped: user_va=0x7000, size=0x18 -> kernel_va=0xffffffc000026000
+[ 54.566119 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0x8000, len=0x10, kernel_va=0xffffffc000027000, map_size=0x1000
+[ 54.566611 0:36 starry_kernel::pseudofs::dev::k3_airunner:495]   output[0] mapped: user_va=0x8000, size=0x10 -> kernel_va=0xffffffc000027000
+[ 54.567045 0:36 starry_kernel::pseudofs::dev::k3_airunner:506]   attr_size: 72 bytes
+[ 54.567334 0:36 starry_kernel::pseudofs::dev::k3_airunner:426] I received the node:
+[ 54.567595 0:36 starry_kernel::pseudofs::dev::k3_airunner:427]   node_id: 1
+[ 54.567835 0:36 starry_kernel::pseudofs::dev::k3_airunner:428]   op: KernelOp(1)
+[ 54.568084 0:36 starry_kernel::pseudofs::dev::k3_airunner:429]   target_hint: AiTargetHint(1)
+[ 54.568423 0:36 starry_kernel::pseudofs::dev::k3_airunner:430]   input_count: 2, output_count: 1
+[ 54.568714 0:36 starry_kernel::pseudofs::dev::k3_airunner:435]   input[0]: dtype=AiDtype(0), ndim=2, shape=[2, 2]
+[ 54.569091 0:36 starry_kernel::pseudofs::dev::k3_airunner:435]   input[1]: dtype=AiDtype(0), ndim=2, shape=[2, 3]
+[ 54.569428 0:36 starry_kernel::pseudofs::dev::k3_airunner:442]   output[0]: dtype=AiDtype(0), ndim=2, shape=[2, 3]
+[ 54.569817 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0x9000, len=0x10, kernel_va=0xffffffc000028000, map_size=0x1000
+[ 54.570360 0:36 starry_kernel::pseudofs::dev::k3_airunner:468]   input[0] mapped: user_va=0x9000, size=0x10 -> kernel_va=0xffffffc000028000
+[ 54.570803 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0xa000, len=0x18, kernel_va=0xffffffc000029000, map_size=0x1000
+[ 54.571299 0:36 starry_kernel::pseudofs::dev::k3_airunner:468]   input[1] mapped: user_va=0xa000, size=0x18 -> kernel_va=0xffffffc000029000
+[ 54.571797 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0xb000, len=0x18, kernel_va=0xffffffc00002a000, map_size=0x1000
+[ 54.572305 0:36 starry_kernel::pseudofs::dev::k3_airunner:495]   output[0] mapped: user_va=0xb000, size=0x18 -> kernel_va=0xffffffc00002a000
+[ 54.572702 0:36 starry_kernel::pseudofs::dev::k3_airunner:506]   attr_size: 72 bytes
+[ 54.572961 0:36 starry_kernel::pseudofs::dev::k3_airunner:426] I received the node:
+[ 54.573219 0:36 starry_kernel::pseudofs::dev::k3_airunner:427]   node_id: 2
+[ 54.573513 0:36 starry_kernel::pseudofs::dev::k3_airunner:428]   op: KernelOp(1)
+[ 54.573767 0:36 starry_kernel::pseudofs::dev::k3_airunner:429]   target_hint: AiTargetHint(1)
+[ 54.574089 0:36 starry_kernel::pseudofs::dev::k3_airunner:430]   input_count: 2, output_count: 1
+[ 54.574385 0:36 starry_kernel::pseudofs::dev::k3_airunner:435]   input[0]: dtype=AiDtype(0), ndim=2, shape=[2, 2]
+[ 54.574721 0:36 starry_kernel::pseudofs::dev::k3_airunner:435]   input[1]: dtype=AiDtype(0), ndim=2, shape=[2, 3]
+[ 54.575111 0:36 starry_kernel::pseudofs::dev::k3_airunner:442]   output[0]: dtype=AiDtype(0), ndim=2, shape=[2, 3]
+[ 54.575504 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0x8000, len=0x10, kernel_va=0xffffffc00002b000, map_size=0x1000
+[ 54.576044 0:36 starry_kernel::pseudofs::dev::k3_airunner:468]   input[0] mapped: user_va=0x8000, size=0x10 -> kernel_va=0xffffffc00002b000
+[ 54.576496 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0xb000, len=0x18, kernel_va=0xffffffc00002c000, map_size=0x1000
+[ 54.577023 0:36 starry_kernel::pseudofs::dev::k3_airunner:468]   input[1] mapped: user_va=0xb000, size=0x18 -> kernel_va=0xffffffc00002c000
+[ 54.577620 0:36 starry_kernel::pseudofs::dev::k3_airunner:711] k3_airunner: map_user_to_kernel pid=36, user_va=0xd000, len=0x18, kernel_va=0xffffffc00002d000, map_size=0x1000
+[ 54.578118 0:36 starry_kernel::pseudofs::dev::k3_airunner:495]   output[0] mapped: user_va=0xd000, size=0x18 -> kernel_va=0xffffffc00002d000
+[ 54.578578 0:36 starry_kernel::pseudofs::dev::k3_airunner:506]   attr_size: 72 bytes
+[ 54.579142 0:36 starry_kernel::pseudofs::dev::k3_airunner:528] k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid=36, token=42, graph_va=0x8e060, graph_size=0x1490
+[ 54.579251 3:33 k3_aiScheduler::scheduler:102] run node: node_id=0, op=KernelOp(1)
+[ 54.580090 3:33 k3_kernel_backend:107] k3_run_kernel: node_id=0, op=KernelOp(1), target_hint=1
+[ 54.580498 3:33 k3_kernel_backend::matmul:108] run mutmal in cpu
+[ 54.580778 3:33 k3_kernel_backend::matmul:146] [kernel backend matmul: log]:
+[ 54.581083 3:33 k3_kernel_backend::matmul:147]   shape: 2x3 @ 3x2 -> 2x2
+[ 54.581395 3:33 k3_kernel_backend::matmul:148]   batch: 1
+[ 54.581629 3:33 k3_kernel_backend::matmul:151]   cpu matmul output (2x2):
+[ 54.581945 3:33 k3_kernel_backend::matmul:159]     [ 1.0 2.0 ]
+[ 54.582193 3:33 k3_kernel_backend::matmul:159]     [ 4.0 5.0 ]
+[ 54.582429 3:33 k3_aiScheduler::scheduler:109] k3_run_kernel success: node_id=0, op=KernelOp(1)
+[ 54.582798 3:33 k3_aiScheduler::scheduler:102] run node: node_id=1, op=KernelOp(1)
+[ 54.583084 3:33 k3_kernel_backend:107] k3_run_kernel: node_id=1, op=KernelOp(1), target_hint=1
+[ 54.583545 3:33 k3_kernel_backend::matmul:108] run mutmal in cpu
+[ 54.583785 3:33 k3_kernel_backend::matmul:146] [kernel backend matmul: log]:
+[ 54.584077 3:33 k3_kernel_backend::matmul:147]   shape: 2x2 @ 2x3 -> 2x3
+[ 54.584352 3:33 k3_kernel_backend::matmul:148]   batch: 1
+[ 54.584575 3:33 k3_kernel_backend::matmul:151]   cpu matmul output (2x3):
+[ 54.584881 3:33 k3_kernel_backend::matmul:159]     [ 2.0 4.0 6.0 ]
+[ 54.585183 3:33 k3_kernel_backend::matmul:159]     [ 8.0 10.0 12.0 ]
+[ 54.585489 3:33 k3_aiScheduler::scheduler:109] k3_run_kernel success: node_id=1, op=KernelOp(1)
+[ 54.585854 3:33 k3_aiScheduler::scheduler:102] run node: node_id=2, op=KernelOp(1)
+[ 54.586192 3:33 k3_kernel_backend:107] k3_run_kernel: node_id=2, op=KernelOp(1), target_hint=1
+[ 54.586517 3:33 k3_kernel_backend::matmul:108] run mutmal in cpu
+[ 54.586769 3:33 k3_kernel_backend::matmul:146] [kernel backend matmul: log]:
+[ 54.587050 3:33 k3_kernel_backend::matmul:147]   shape: 2x2 @ 2x3 -> 2x3
+[ 54.587332 3:33 k3_kernel_backend::matmul:148]   batch: 1
+[ 54.587596 3:33 k3_kernel_backend::matmul:151]   cpu matmul output (2x3):
+[ 54.587955 3:33 k3_kernel_backend::matmul:159]     [ 18.0 24.0 30.0 ]
+[ 54.588272 3:33 k3_kernel_backend::matmul:159]     [ 48.0 66.0 84.0 ]
+[ 54.588607 3:33 k3_aiScheduler::scheduler:109] k3_run_kernel success: node_id=2, op=KernelOp(1)
+[ 54.588999 3:33 k3_aiScheduler::scheduler:117] task completed, token=42
+comple task ,token:42
+d result (2×3):
+  [  18.0  24.0  30.0 ]
+  [  48.0  66.0  84.0 ]
+continue , current avoid kernel access user addr
+^C
+root@starry:/root # exit
+
+✓ 已退出串口终端模式
+
+
+
+
+
+全部 16 个输出值匹配，tile 边界外的 pad 区域未被触动。核心结论：
+
+A100 上 smt.vmadot i8 的 tile 实际是 4×8×4，和文档标的 8×16×8 不一致——可能是这版硅前出片的行为
+vle8.v 一次拉 128 字节，vse32.v m2 一次写 64 个 int32，缓冲区要给够
+smt.vmadot 是 accumulate 语义，使用前必须 vmv.v.i 清零 vd 寄存器组
+文档哪一行
+Bash Search doc for A100 tile 8×16×8 claims
+IN
+grep -n '8 × 16 × 8\|8×16×8\|M = N = 8; K = 16\|A064.*K = 16' /home/inkbottle/othersrc/k3/ime_extension.md
+
+OUT
+282:|`Xsmti8i32mm`：整数矩阵乘法指令|[U]Int8|Int32|`8 × 16 × 8`|
+283:|`Xsmti8i32mm_slide`：面向卷积场景的整数滑窗矩阵乘法|[U]Int8|Int32|`8 × 16 × 8`|
+286:|`Xsmti8*16mm_scl16f`：面向分块量化的整数矩阵乘法指令|[U]Int8 + scale|FP16 / BF16|`8 × 16 × 8`|
+494:|`smt.vmadot`|`smt.vmadot vd, vs1, vs2, i4`<br>`smt.vmadot vd, vs1, vs2, i8`|`Int4 × Int4 → Int32`<br>`Int8 × Int8 → Int32`|**A60**：<br>Int8：`4 × 8 × 4`;<br>**A100**：<br>Int4：`8 × 32 × 8`;<br>Int8：`8 × 16 × 8`|
+505:    M = N = 8; K = 16;
+526:    M = N = 8; K = 16;
+634:|`smt.vmadot1*`|`smt.vmadot1`,<br> `smt.vmadot1u`,<br> `smt.vmadot1us`,<br> `smt.vmadot1su`|`smt.vmadot1 vd, vs1, vs2, i8`<br>`smt.vmadot1u vd, vs1, vs2, i8`<br>`smt.vmadot1us vd, vs1, vs2, i8`<br>`smt.vmadot1su vd, vs1, vs2, i8`|1|`[U]Int8 × [U]Int8 → Int32`|**A60**：`4 × 8 × 4`<br>**A100**：`8 × 16 × 8`|
+642:    M = N = 8; K = 16;
+1052:|`smt.vmadot.hp`|`smt.vmadot.hp vd, vs1, vs2, v0/v1, imm3, i4`<br>`smt.vmadot.hp vd, vs1, vs2, v0/v1, imm3, i8`|`(Int4 × Int4) * FP16 → FP16`<br>`(Int4 × Int4) * BF16 → BF16`<br>`(Int8 × Int8) * FP16 → FP16`<br>`(Int8 × Int8) * BF16 → BF16`|`V0` / `V1`|`imm3`|Int4：`8 × 32 × 8`;<br>Int8：`8 × 16 × 8`|
+1066:M = N = 8; K = 16;
+2172:|A100|`Xsmti8i32mm`：整数矩阵乘法指令|Int8|Int32|`8 × 16 × 8`|
+2174:|A100|`Xsmti8i32mm_slide`：面向卷积场景的整数滑窗矩阵乘法|Int8|Int32|`8 × 16 × 8`|
+2177:|A100|`Xsmti8*16mm_scl16f`：面向分块量化的整数矩阵乘法指令|Int8 + scale|FP16 / BF16|`8 × 16 × 8`|
+文档有 12 处声称 A100 Int8 tile 是 8×16×8。最关键的三处：
+
+第 2.5 节 tile 形状总览（line 282）：
+
+ime_extension.md:282 — Xsmti8i32mm：8 × 16 × 8
+
+第 5.1.2 节指令成员表（line 494）：
+
+ime_extension.md:494 — A100：Int8：8 × 16 × 8
+
+第 5.1.3 节程序可见语义（line 505）：
+
+ime_extension.md:505 — M = N = 8; K = 16; (A064 → A100)
+
+附录 A.1（line 2172）：
+
+ime_extension.md:2172 — 同样的 8 × 16 × 8
+
+实测硬件按 4×8×4（A60 尺寸）执行，文档 v0.6 2026/4/13 标注的 A100 tile 和硅前芯片行为对不上。
