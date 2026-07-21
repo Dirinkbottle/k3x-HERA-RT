@@ -1,105 +1,76 @@
 //! k3 芯片 AI 算子库。
+//!
+//! backend 提供 `k3_run_kernel` 分发入口，把内核调度器传入的 `AiGraphNode`
+//! 拆成 tensor view 与调用描述，按 `op` 路由到具体算子实现（当前实现 matmul）。
 
 #![no_std]
+#![deny(missing_docs)]
+#![deny(clippy::missing_docs_in_private_items)]
 
 extern crate alloc;
 
-use core::ptr::read_unaligned;
+use k3_ai_uabi::error::BackendErr;
+use k3_ai_uabi::{AiGraphNode, KernelOp, MAX_SUBMIT_TENSORS};
+use log::{error, info};
 
-use k3_aiUabi::error::BackendErr;
-use k3_aiUabi::{
-    AiDtype, AiGraphNode, AiTensorDesc, AiTensorFormat, AiTensorLayout, KernelOp, MAX_DIM,
-    MAX_SUBMIT_TENSORS,
-};
-use log::error;
+pub mod binary;
+pub mod call;
+pub mod conv2d;
 pub mod matmul;
+pub mod nn;
+mod rvv;
+pub mod transform;
+pub mod unary;
 
-/// backend 算子的 tensor 视图，`data` 指向当前地址空间可访问的连续内存。
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct BackendTensorView {
-    pub data: *mut u8,
-    pub byte_len: u64,
-    pub shape: [u32; MAX_DIM],
-    pub stride_bytes: [u64; MAX_DIM],
-    pub ndim: u32,
-    pub dtype: AiDtype,
-    pub format: AiTensorFormat,
-    pub layout: AiTensorLayout,
-    pub flags: u32,
-}
-
-impl Default for BackendTensorView {
-    fn default() -> Self {
-        Self {
-            data: core::ptr::null_mut(),
-            byte_len: 0,
-            shape: [0; MAX_DIM],
-            stride_bytes: [0; MAX_DIM],
-            ndim: 0,
-            dtype: AiDtype::default(),
-            format: AiTensorFormat::default(),
-            layout: AiTensorLayout::default(),
-            flags: 0,
-        }
-    }
-}
-
-impl BackendTensorView {
-    fn from_desc(desc: &AiTensorDesc) -> Self {
-        if desc.kernel_va == 0 {
-            error!("desc tensor has null kernel_va!");
-        }
-
-        Self {
-            data: desc.kernel_va as *mut u8,
-            byte_len: desc.size_bytes,
-            shape: desc.shape,
-            stride_bytes: desc.stride_bytes,
-            ndim: desc.ndim,
-            dtype: desc.dtype,
-            format: desc.format,
-            layout: desc.layout,
-            flags: desc.flags as u32,
-        }
-    }
-}
-
-/// 单次 backend 算子调用描述。
-#[repr(C)]
-pub struct BackendCall {
-    /// 操作类型。
-    pub op: KernelOp,
-    /// 执行目标（CPU/X100/A100）。
-    pub target: u8,
-    pub inputs: *const BackendTensorView,
-    pub input_count: u32,
-    pub outputs: *mut BackendTensorView,
-    pub output_count: u32,
-    // kernel attr类型地址
-    pub attr: *const u8,
-    // kernel attr大小
-    pub attr_size: u32,
-}
+pub use call::{BackendCall, BackendTensorView};
 
 /// 内核入口,tensor地址需要已经映射
 /// backend 算子分发入口，按 `call.op` 路由到对应算子执行器。
+///
+/// # Safety
+///
+/// `node.desc.tensors[*].kernel_va` 必须已经映射到 backend 当前地址空间可访问的
+/// 有效内存，且输入/输出 tensor 的生命周期覆盖本次调用。
 pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
     let desc = &node.desc;
+    let total_count = match desc.input_count.checked_total(desc.output_count) {
+        Ok(total_count) => total_count,
+        Err(err) => {
+            error!("k3_run_kernel: invalid tensor count: {:?}", err);
+            return -1;
+        }
+    };
+    if total_count > MAX_SUBMIT_TENSORS {
+        error!(
+            "k3_run_kernel: tensor count {} exceeds max {}",
+            total_count, MAX_SUBMIT_TENSORS
+        );
+        return -1;
+    }
+
+    let input_count = desc.input_count.get() as usize;
+    let output_count = desc.output_count.get() as usize;
+
     let mut input_views = [BackendTensorView::default(); MAX_SUBMIT_TENSORS];
     let mut output_views = [BackendTensorView::default(); MAX_SUBMIT_TENSORS];
 
-    for i in 0..desc.input_count as usize {
-        input_views[i] = BackendTensorView::from_desc(&desc.tensors[i]);
+    for (view, tensor) in input_views
+        .iter_mut()
+        .zip(desc.tensors[..input_count].iter())
+    {
+        *view = BackendTensorView::from_desc(tensor);
     }
-    for i in 0..desc.output_count as usize {
-        output_views[i] =
-            BackendTensorView::from_desc(&desc.tensors[desc.input_count as usize + i]);
+    for (view, tensor) in output_views
+        .iter_mut()
+        .zip(desc.tensors[input_count..total_count].iter())
+        .take(output_count)
+    {
+        *view = BackendTensorView::from_desc(tensor);
     }
 
     let call = BackendCall {
         op: desc.op,
-        target: desc.target_hint.0 as u8,
+        target: desc.target_hint.0,
         inputs: input_views.as_ptr(),
         input_count: desc.input_count,
         outputs: output_views.as_mut_ptr(),
@@ -108,13 +79,36 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
         attr_size: desc.attr_size,
     };
 
-    error!(
+    info!(
         "k3_run_kernel: node_id={}, op={:?}, target_hint={}",
         node.node_id, desc.op, desc.target_hint.0
     );
 
     let result = match desc.op {
-        KernelOp::MAT_MUL => matmul::matmul_caller(&call),
+        KernelOp::MAT_MUL => unsafe { matmul::matmul_caller(&call) },
+        KernelOp::SILU => unsafe { unary::unary_caller(&call, unary::UnaryKind::Silu) },
+        KernelOp::SIGMOID => unsafe { unary::unary_caller(&call, unary::UnaryKind::Sigmoid) },
+        KernelOp::SCALE => unsafe { unary::unary_caller(&call, unary::UnaryKind::Scale) },
+        KernelOp::ADD => unsafe { binary::binary_caller(&call, binary::BinaryKind::Add) },
+        KernelOp::MUL => unsafe { binary::binary_caller(&call, binary::BinaryKind::Mul) },
+        KernelOp::SUB => unsafe { binary::binary_caller(&call, binary::BinaryKind::Sub) },
+        KernelOp::DIV => unsafe { binary::binary_caller(&call, binary::BinaryKind::Div) },
+        KernelOp::MOD => unsafe { binary::binary_caller(&call, binary::BinaryKind::Mod) },
+        KernelOp::CONV2D => unsafe { conv2d::conv2d_caller(&call) },
+        KernelOp::RMS_NORM => unsafe { nn::rms_norm_caller(&call) },
+        KernelOp::ROPE => unsafe { nn::rope_caller(&call) },
+        KernelOp::SOFTMAX => unsafe { nn::softmax_caller(&call) },
+        KernelOp::MAX_POOL => unsafe { nn::max_pool_caller(&call) },
+        KernelOp::REDUCE_MAX => unsafe { nn::reduce_max_caller(&call) },
+        KernelOp::TOP_K => unsafe { nn::top_k_caller(&call) },
+        KernelOp::CONCAT => unsafe { transform::concat_caller(&call) },
+        KernelOp::TRANSPOSE => unsafe { transform::transpose_caller(&call) },
+        KernelOp::GATHER => unsafe { transform::gather_caller(&call) },
+        KernelOp::GATHER_ELEMENTS => unsafe { transform::gather_elements_caller(&call) },
+        KernelOp::CAST => unsafe { transform::cast_caller(&call) },
+        KernelOp::RESIZE => unsafe { transform::resize_caller(&call) },
+        KernelOp::EXPAND => unsafe { transform::expand_caller(&call) },
+        KernelOp::TILE => unsafe { transform::tile_caller(&call) },
         _ => Err(BackendErr::UnsupportedOp),
     };
 
@@ -124,5 +118,23 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
             error!("k3_run_kernel failed: {:?}", e);
             -1
         }
+    }
+}
+
+/// `k3_run_kernel` 分发入口的单元测试。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k3_ai_uabi::TensorCount;
+
+    /// tensor 总数超限时应在解引用数组前就拒绝并返回 -1。
+    #[test]
+    fn k3_run_kernel_rejects_too_many_tensors_before_indexing() {
+        let mut node = AiGraphNode::default();
+        node.desc.op = KernelOp::MAT_MUL;
+        node.desc.input_count = TensorCount::new(MAX_SUBMIT_TENSORS as u32 + 1);
+        node.desc.output_count = TensorCount::new(0);
+
+        assert_eq!(unsafe { k3_run_kernel(&node) }, -1);
     }
 }

@@ -3,5 +3,8 @@ name = "k3_aiUabi"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "k3_ai_uabi"
+
 [dependencies]
 bitflags = "2.13.0"

@@ -6,7 +6,7 @@
 pub mod kd_uring;
 pub mod tensormanager;
 
-// ── 从 k3_aiUabi 重导出 ──────────────────────────────────────────
+// ── 从 k3_ai_uabi 重导出 ──────────────────────────────────────────
 
-pub use k3_aiUabi::*;
+pub use k3_ai_uabi::*;
 pub use tensormanager::{Tensor, TensorManager};

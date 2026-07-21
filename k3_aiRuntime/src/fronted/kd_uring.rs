@@ -17,48 +17,65 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::fronted::{AI_ABI_VERSION, AiGraphSubmitEntry};
+use k3_ai_uabi::error::AiRuntimeErr;
+use k3_ai_uabi::*;
 use lazy_static::lazy_static;
 use ov_channels::{ChannelId, Message, Receiver, Sender, SharedMemory};
-use crate::fronted::{AI_ABI_VERSION, AiGraphSubmitEntry};
-use k3_aiUabi::*;
-use k3_aiUabi::error::AiRuntimeErr;
 
-
-// 共享内存请求/返回参数。
-// 用户传入自己 mmap 出来的共享区地址和大小，内核校验它是否是 shared backend，
-// 然后把对应 SharedPages 保活并回填 pid / flags 等元信息。
+/// 共享内存请求/返回参数。
+///
+/// 用户传入自己 mmap 出来的共享区地址和大小，内核校验它是否是 shared backend，
+/// 然后把对应 SharedPages 保活并回填 pid / flags 等元信息。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct K3AiChannelBuildParam {
+    /// 共享区用户态虚拟地址。
     pub user_va: u64,
+    /// 共享区字节数。
     pub size_bytes: u64,
+    /// 共享区内 channel 的数量。
     pub channel_count: u32,
+    /// 建立标志位，阶段一保留。
     pub flags: u32,
+    /// 内核回填的持有者 pid。
     pub owner_pid: u32,
 }
 
-// 用户态保存下来的共享区句柄。
-// `memory` 持有这段 mmap，避免 build_channel 返回后就丢失。
+/// 用户态保存下来的共享区句柄。
+///
+/// `_memory` 持有这段 mmap，避免 build_channel 返回后就丢失。
 pub struct ChannelMemory {
+    /// 共享区用户态虚拟地址。
     pub user_va: usize,
+    /// 共享区字节数。
     pub size_bytes: usize,
+    /// 持有底层 mmap，保证共享区在 channel 存活期间不被释放。
     _memory: Arc<MmapMemory>,
 }
 
+/// 一条建立好的提交通道：设备句柄 + 共享内存 + 收发端。
 pub struct UringChannel {
+    /// `/dev/k3_airunner` 的打开句柄。
     dev: File,
+    /// channel 共享内存句柄。
     pub shared: ChannelMemory,
-    graph_sender:Option<Sender<'static>>,
-    complete_reciver:Option<Receiver<'static>>
+    /// graph 提交发送端（channel 0）。
+    graph_sender: Option<Sender<'static>>,
+    /// 完成通知接收端（channel 1）。
+    complete_reciver: Option<Receiver<'static>>,
 }
 
 // 当前进程先只允许建立一个 channel，共享区一直保留到进程退出。
 lazy_static! {
+    /// 进程级共享区持有槽：保证 channel 共享内存直到进程退出前一直存活。
     static ref CHANNEL_MEMORY: Mutex<Option<Arc<MmapMemory>>> = Mutex::new(None);
 }
 
 unsafe extern "C" {
+    /// libc `ioctl`：向设备发送控制命令。
     fn ioctl(fd: c_int, request: c_ulong, arg: usize) -> c_int;
+    /// libc `mmap`：建立内存映射。
     fn mmap(
         addr: *mut c_void,
         length: usize,
@@ -67,18 +84,26 @@ unsafe extern "C" {
         fd: c_int,
         offset: isize,
     ) -> *mut c_void;
+    /// libc `munmap`：解除内存映射。
     fn munmap(addr: *mut c_void, length: usize) -> c_int;
 }
 
+/// `mmap` 保护位：页可读。
 const PROT_READ: c_int = 0x1;
+/// `mmap` 保护位：页可写。
 const PROT_WRITE: c_int = 0x2;
+/// `mmap` 标志：映射对其他进程/内核可见的共享内存。
 const MAP_SHARED: c_int = 0x01;
+/// `mmap` 标志：匿名映射，不关联文件。
 const MAP_ANONYMOUS: c_int = 0x20;
+/// `mmap` 失败时返回的哨兵指针。
 const MAP_FAILED: *mut c_void = !0 as *mut c_void;
 
-// 持有 mmap 映射，Drop 时自动 munmap。
+/// 持有 mmap 映射，Drop 时自动 munmap。
 pub(crate) struct MmapMemory {
+    /// 映射区首地址。
     pub(crate) ptr: *mut u8,
+    /// 映射区字节数。
     pub(crate) len: usize,
 }
 
@@ -123,14 +148,17 @@ impl MmapMemory {
         })
     }
 
+    /// 映射区首地址的只读指针。
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr.cast_const()
     }
 
+    /// 映射区首地址的可写指针。
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr
     }
 
+    /// 映射区字节数。
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -193,12 +221,20 @@ pub fn build_channel() -> Result<UringChannel, AiRuntimeErr> {
         .receiver(ChannelId::new(K3_CHANNEL_RECIVERID))
         .map_err(|_| AiRuntimeErr::ChannelNotInitialized)?;
 
-    Ok(UringChannel { dev, shared, graph_sender: Some(sender_channel_0), complete_reciver: Some(reciver_channel_1) })
+    Ok(UringChannel {
+        dev,
+        shared,
+        graph_sender: Some(sender_channel_0),
+        complete_reciver: Some(reciver_channel_1),
+    })
 }
 
 /// 用户接口
 /// 提交 graph 描述。当前仍然只通过 ioctl 把 `AiGraphSubmitEntry` 指针传给内核。
-pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) -> Result<(), AiRuntimeErr> {
+pub fn submit_graph(
+    channel: &UringChannel,
+    graph_entry: &AiGraphSubmitEntry,
+) -> Result<(), AiRuntimeErr> {
     let va = channel.shared.user_va;
 
     if va == 0
@@ -213,9 +249,13 @@ pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) ->
         return Err(AiRuntimeErr::InvalidAbiVersion);
     }
 
-    let sender = channel.graph_sender.ok_or(AiRuntimeErr::ChannelNotInitialized)?;
+    let sender = channel
+        .graph_sender
+        .ok_or(AiRuntimeErr::ChannelNotInitialized)?;
 
-    let data = graph_entry.to_le_byte().ok_or(AiRuntimeErr::SerializeFailed)?;
+    let data = graph_entry
+        .to_le_byte()
+        .ok_or(AiRuntimeErr::SerializeFailed)?;
     sender
         .try_send(&Message::data(data))
         .map_err(|_| AiRuntimeErr::SendFailed)?;
@@ -227,6 +267,7 @@ pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) ->
             graph_entry as *const _ as usize,
         )
     };
+    println!("submit_graph ioctl ret: {}", ret);
     if ret < 0 {
         return Err(AiRuntimeErr::IoctlFailed);
     }
@@ -235,16 +276,24 @@ pub fn submit_graph(channel: &UringChannel, graph_entry: &AiGraphSubmitEntry) ->
 }
 
 /// completion 通路后续再接。
-pub fn wait_graph_complete(_graph_entry: &AiGraphSubmitEntry, channel: &UringChannel) -> Result<(), AiRuntimeErr> {
-    let reciver = channel.complete_reciver.ok_or(AiRuntimeErr::ChannelNotInitialized)?;
-
+pub fn wait_graph_complete(
+    _graph_entry: &AiGraphSubmitEntry,
+    channel: &UringChannel,
+) -> Result<(), AiRuntimeErr> {
+    let reciver = channel
+        .complete_reciver
+        .ok_or(AiRuntimeErr::ChannelNotInitialized)?;
+    println!(
+        "wait_graph_complete.....: waiting for graph completion, user_token={}",
+        _graph_entry.user_token
+    );
     loop {
-        if let Some(msg) = reciver.try_recv() {
-            if let Some(token) = msg.as_notification() {
-                if token == _graph_entry.user_token {
-                    return Ok(());
-                }
-            }
+        if let Some(msg) = reciver.try_recv()
+            && let Some(token) = msg.as_notification()
+            && token == _graph_entry.user_token.get()
+        {
+            println!("wait_graph_complete: graph completed, user_token={}", token);
+            return Ok(());
         }
         std::thread::yield_now();
     }

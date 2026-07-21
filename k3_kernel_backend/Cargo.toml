@@ -3,6 +3,12 @@ name = "k3_kernel_backend"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+a100-fp16-ime = []
+
 [dependencies]
 k3_aiUabi = { path = "../k3_aiUabi" }
 log = "0.4.32"
+libm = "0.2"
+half = { version = "2", default-features = false }

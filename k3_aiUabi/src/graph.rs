@@ -8,7 +8,10 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::mem;
 
-use crate::{AI_ABI_VERSION, AiKernelDesc};
+use crate::{
+    AI_ABI_VERSION, AiKernelDesc, ByteOffset, ByteSize, EdgeCount, GraphFlags, NodeCount,
+    SubmitFlags, UserToken, UserVa,
+};
 
 /// graph blob 魔数
 pub const AI_GRAPH_MAGIC: u32 = 0x4845_5241; // "HERA"
@@ -19,10 +22,14 @@ pub const AI_GRAPH_MAGIC: u32 = 0x4845_5241; // "HERA"
 pub struct GraphSubmitKind(pub u32);
 
 impl GraphSubmitKind {
+    /// 提交一次 graph 执行。
     pub const GRAPH_SUBMIT: Self = Self(1);
+    /// 取消一次已提交的 graph。
     pub const CANCEL: Self = Self(2);
+    /// 查询已提交 graph 的状态。
     pub const QUERY: Self = Self(3);
 
+    /// 最小合法性检查：提交类型是否落在已知区间内。
     pub const fn is_known(self) -> bool {
         matches!(self.0, 1..=3)
     }
@@ -46,20 +53,20 @@ pub struct AiGraphSubmitEntry {
     pub submit_kind: GraphSubmitKind,
 
     /// 提交 fgs，保留。
-    pub flags: u32,
+    pub flags: SubmitFlags,
 
     /// 预留字段，保持 8 字节对齐。
     pub reserved0: u32,
 
     /// 用户态 completion cookie。
     /// 用户态用它匹配完成的 graph。
-    pub user_token: u32,
+    pub user_token: UserToken,
 
     /// graph blob 的用户态虚拟地址。
-    pub graph_user_va: u64,
+    pub graph_user_va: UserVa,
 
     /// graph blob 总字节数。
-    pub graph_size: u64,
+    pub graph_size: ByteSize,
 }
 
 impl Default for AiGraphSubmitEntry {
@@ -67,26 +74,29 @@ impl Default for AiGraphSubmitEntry {
         Self {
             abi_version: AI_ABI_VERSION,
             submit_kind: GraphSubmitKind::GRAPH_SUBMIT,
-            flags: 0,
+            flags: SubmitFlags::new(0),
             reserved0: 0,
-            user_token: 0,
-            graph_user_va: 0,
-            graph_size: 0,
+            user_token: UserToken::new(0),
+            graph_user_va: UserVa::new(0),
+            graph_size: ByteSize::new(0),
         }
     }
 }
 
 impl AiGraphSubmitEntry {
+    /// 构造一个 graph 提交入口。
+    ///
+    /// `abi_version` 固定为 `AI_ABI_VERSION`，`flags`/`reserved0` 归零。
     pub fn new(
-        user_token: u32,
-        graph_user_va: u64,
-        graph_size: u64,
+        user_token: UserToken,
+        graph_user_va: UserVa,
+        graph_size: ByteSize,
         submit_kind: GraphSubmitKind,
     ) -> Self {
         Self {
             abi_version: AI_ABI_VERSION,
             submit_kind,
-            flags: 0,
+            flags: SubmitFlags::new(0),
             reserved0: 0,
             user_token,
             graph_user_va,
@@ -118,22 +128,22 @@ pub struct AiGraphHeader {
     pub magic: u32,
 
     /// 整个 graph blob 的字节数。
-    pub total_size: u32,
+    pub total_size: ByteOffset,
 
     /// graph flags，阶段一先保留。
-    pub flags: u32,
+    pub flags: GraphFlags,
 
     /// 节点数量。
-    pub node_count: u32,
+    pub node_count: NodeCount,
 
     /// 依赖边数量。
-    pub edge_count: u32,
+    pub edge_count: EdgeCount,
 
     /// node 数组在 graph blob 内的偏移。
-    pub nodes_offset: u32,
+    pub nodes_offset: ByteOffset,
 
     /// edge 数组在 graph blob 内的偏移。
-    pub edges_offset: u32,
+    pub edges_offset: ByteOffset,
 }
 
 /// graph node 是 `AiKernelDesc` 的薄封装。
@@ -143,7 +153,7 @@ pub struct AiGraphHeader {
 #[derive(Clone, Copy, Default)]
 pub struct AiGraphNode {
     /// graph 内稳定节点编号。
-    pub node_id: u32,
+    pub node_id: AiGraphNodeId,
     /// 单个 lowered 算子的描述。
     pub desc: AiKernelDesc,
     /// Graph节点的状态
@@ -154,15 +164,20 @@ pub struct AiGraphNode {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AiGraphState {
+    /// 该节点是否已执行完成。
     complete: bool,
-    // bitflag 按位解释错误原因
+    /// 错误原因位图，按 `GraphAiErrorFlags` 解释。
     error_flag: u8,
 }
 
 bitflags! {
+    /// graph 节点执行错误原因位标志。
     pub struct GraphAiErrorFlags: u32 {
+        /// 错误原因位 A。
         const A = 0b00000001;
+        /// 错误原因位 B。
         const B = 0b00000010;
+        /// 错误原因位 C。
         const C = 0b00000100;
     }
 }
@@ -173,8 +188,10 @@ bitflags! {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AiGraphEdge {
-    pub from_node: u32,
-    pub to_node: u32,
+    /// 依赖边起点节点 id（前置节点）。
+    pub from_node: AiGraphNodeId,
+    /// 依赖边终点节点 id（后继节点）。
+    pub to_node: AiGraphNodeId,
 }
 
 /// 用户态构图时返回的依赖标识。
@@ -182,8 +199,55 @@ pub struct AiGraphEdge {
 /// 当前链尾 node id：继续向这条链追加算子时，
 /// 把这个 id 传给 `push_kernel_depend` 。
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AiGraphNodeId(pub u32);
+
+impl AiGraphNodeId {
+    /// 用原始 node id 构造图节点 id。
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// 返回底层原始 node id。
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// 返回可用于索引的 `usize`。
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl PartialEq<u32> for AiGraphNodeId {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<AiGraphNodeId> for u32 {
+    fn eq(&self, other: &AiGraphNodeId) -> bool {
+        *self == other.0
+    }
+}
+
+impl From<u32> for AiGraphNodeId {
+    fn from(value: u32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<AiGraphNodeId> for u32 {
+    fn from(value: AiGraphNodeId) -> Self {
+        value.get()
+    }
+}
+
+impl core::fmt::Display for AiGraphNodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// 一个 chain id 表示当前主图链的尾节点。
 pub type AiGraphChainId = AiGraphNodeId;
@@ -192,6 +256,7 @@ pub type AiGraphChainId = AiGraphNodeId;
 ///
 /// 一整块连续字节流，
 pub struct AiGraphBlob {
+    /// 序列化后的连续字节流：header + nodes + edges。
     bytes: Vec<u8>,
 }
 
@@ -201,8 +266,12 @@ impl AiGraphBlob {
         nodes: &[AiGraphNode],
         edges: &[AiGraphEdge],
     ) -> Result<Self, AiGraphBuildError> {
-        let node_count = u32::try_from(nodes.len()).map_err(|_| AiGraphBuildError::TooManyNodes)?;
-        let edge_count = u32::try_from(edges.len()).map_err(|_| AiGraphBuildError::TooManyEdges)?;
+        let node_count = NodeCount::new(
+            u32::try_from(nodes.len()).map_err(|_| AiGraphBuildError::TooManyNodes)?,
+        );
+        let edge_count = EdgeCount::new(
+            u32::try_from(edges.len()).map_err(|_| AiGraphBuildError::TooManyEdges)?,
+        );
         validate_graph(nodes, edges)?;
 
         let header_size = mem::size_of::<AiGraphHeader>();
@@ -224,11 +293,13 @@ impl AiGraphBlob {
         let edges_offset = pad_to(&mut bytes, mem::align_of::<AiGraphEdge>())?;
         append_repr_slice(&mut bytes, edges);
 
-        let total_size = u32::try_from(bytes.len()).map_err(|_| AiGraphBuildError::SizeOverflow)?;
+        let total_size = ByteOffset::new(
+            u32::try_from(bytes.len()).map_err(|_| AiGraphBuildError::SizeOverflow)?,
+        );
         let header = AiGraphHeader {
             magic: AI_GRAPH_MAGIC,
             total_size,
-            flags: 0,
+            flags: GraphFlags::new(0),
             node_count,
             edge_count,
             nodes_offset,
@@ -239,15 +310,17 @@ impl AiGraphBlob {
         Ok(Self { bytes })
     }
 
+    /// 返回底层 graph blob 的字节切片。
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    pub fn submit_entry(&self, user_token: u32) -> AiGraphSubmitEntry {
+    /// 基于当前 blob 构造一个可提交到 channel 的 graph 入口。
+    pub fn submit_entry(&self, user_token: UserToken) -> AiGraphSubmitEntry {
         AiGraphSubmitEntry::new(
             user_token,
-            self.bytes.as_ptr() as u64,
-            self.bytes.len() as u64,
+            UserVa::new(self.bytes.as_ptr() as u64),
+            ByteSize::new(self.bytes.len() as u64),
             GraphSubmitKind::GRAPH_SUBMIT,
         )
     }
@@ -255,20 +328,25 @@ impl AiGraphBlob {
 
 /// 解析后的 graph。
 pub struct AiParsedGraph {
+    /// graph 头部元数据。
     pub header: AiGraphHeader,
+    /// 解析出的节点列表。
     pub nodes: Vec<AiGraphNode>,
+    /// 解析出的依赖边列表。
     pub edges: Vec<AiGraphEdge>,
 }
 
+/// 从字节流中解析 graph blob 的工具类型。
 pub struct AiGraphParser;
 
 impl AiGraphParser {
+    /// 校验魔数、大小、分段范围后，把 graph blob 解析成 `AiParsedGraph`。
     pub fn parse(bytes: &[u8]) -> Result<AiParsedGraph, AiGraphParseError> {
         let header: AiGraphHeader = read_repr_at(bytes, 0)?;
         if header.magic != AI_GRAPH_MAGIC {
             return Err(AiGraphParseError::BadMagic(header.magic));
         }
-        if header.total_size as usize != bytes.len() {
+        if header.total_size.get() as usize != bytes.len() {
             return Err(AiGraphParseError::SizeMismatch {
                 header_size: header.total_size,
                 actual_size: bytes.len(),
@@ -279,19 +357,21 @@ impl AiGraphParser {
             "nodes",
             bytes.len(),
             header.nodes_offset,
-            header.node_count,
+            header.node_count.get() as usize,
             mem::size_of::<AiGraphNode>(),
         )?;
         let edges_range = checked_section(
             "edges",
             bytes.len(),
             header.edges_offset,
-            header.edge_count,
+            header.edge_count.get() as usize,
             mem::size_of::<AiGraphEdge>(),
         )?;
 
-        let nodes = read_repr_vec::<AiGraphNode>(&bytes[nodes_range], header.node_count as usize)?;
-        let edges = read_repr_vec::<AiGraphEdge>(&bytes[edges_range], header.edge_count as usize)?;
+        let nodes =
+            read_repr_vec::<AiGraphNode>(&bytes[nodes_range], header.node_count.get() as usize)?;
+        let edges =
+            read_repr_vec::<AiGraphEdge>(&bytes[edges_range], header.edge_count.get() as usize)?;
 
         Ok(AiParsedGraph {
             header,
@@ -304,11 +384,14 @@ impl AiGraphParser {
 /// 用户态 graph 管理器。
 #[derive(Default)]
 pub struct GraphManager {
+    /// 已追加的节点，下标即节点 id。
     nodes: Vec<AiGraphNode>,
+    /// 已追加的依赖边。
     edges: Vec<AiGraphEdge>,
 }
 
 impl GraphManager {
+    /// 创建一个空的 graph 管理器。
     pub fn new() -> Self {
         Self::default()
     }
@@ -363,25 +446,29 @@ impl GraphManager {
         AiGraphBlob::from_parts(&self.nodes, &self.edges)
     }
 
+    /// 追加一个节点，节点 id 等于其在数组中的下标，返回新链尾 id。
     fn push_node(&mut self, desc: AiKernelDesc) -> Result<AiGraphChainId, AiGraphBuildError> {
-        let node_id =
-            u32::try_from(self.nodes.len()).map_err(|_| AiGraphBuildError::TooManyNodes)?;
+        let node_id = AiGraphNodeId::new(
+            u32::try_from(self.nodes.len()).map_err(|_| AiGraphBuildError::TooManyNodes)?,
+        );
         self.nodes.push(AiGraphNode {
             node_id,
             desc,
             state: AiGraphState::default(),
         });
-        Ok(AiGraphNodeId(node_id))
+        Ok(node_id)
     }
 
+    /// 校验节点 id 是否指向本管理器内一个真实存在的节点。
     fn validate_node_id(&self, node_id: AiGraphNodeId) -> Result<(), AiGraphBuildError> {
-        let idx = node_id.0 as usize;
-        if idx >= self.nodes.len() || self.nodes[idx].node_id != node_id.0 {
+        let idx = node_id.as_usize();
+        if idx >= self.nodes.len() || self.nodes[idx].node_id != node_id {
             return Err(AiGraphBuildError::InvalidDepend(node_id));
         }
         Ok(())
     }
 
+    /// 追加依赖边前先校验节点 id 合法性和是否引入环。
     fn push_edge_checked(
         &mut self,
         from: AiGraphNodeId,
@@ -390,18 +477,19 @@ impl GraphManager {
         self.validate_node_id(from)?;
         self.validate_node_id(to)?;
 
-        if from == to || self.reaches(to.0, from.0) {
+        if from == to || self.reaches(to, from) {
             return Err(AiGraphBuildError::CycleDetected);
         }
 
         self.edges.push(AiGraphEdge {
-            from_node: from.0,
-            to_node: to.0,
+            from_node: from,
+            to_node: to,
         });
         Ok(())
     }
 
-    fn reaches(&self, start: u32, target: u32) -> bool {
+    /// 从 `start` 出发按依赖边做 DFS，判断能否到达 `target`（用于环检测）。
+    fn reaches(&self, start: AiGraphNodeId, target: AiGraphNodeId) -> bool {
         let mut stack = vec![start];
         let mut visited = vec![false; self.nodes.len()];
 
@@ -410,7 +498,7 @@ impl GraphManager {
                 return true;
             }
 
-            let idx = node_id as usize;
+            let idx = node_id.as_usize();
             if idx >= visited.len() || visited[idx] {
                 continue;
             }
@@ -427,33 +515,53 @@ impl GraphManager {
     }
 }
 
+/// 构图阶段的错误。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AiGraphBuildError {
+    /// 节点数超过 `u32` 上限。
     TooManyNodes,
+    /// 边数超过 `u32` 上限。
     TooManyEdges,
+    /// 依赖引用了不存在的节点 id。
     InvalidDepend(AiGraphNodeId),
+    /// 检测到依赖环。
     CycleDetected,
+    /// blob 尺寸计算溢出。
     SizeOverflow,
 }
 
+/// 解析 graph blob 时的错误。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AiGraphParseError {
+    /// 字节流长度不足以容纳所需结构。
     TooSmall,
+    /// 魔数与 `AI_GRAPH_MAGIC` 不符，携带实际读到的值。
     BadMagic(u32),
+    /// ABI 版本不匹配，携带实际读到的值。
     BadAbi(u32),
+    /// header 声明的大小与实际字节数不一致。
     SizeMismatch {
-        header_size: u32,
+        /// header 中声明的总大小。
+        header_size: ByteOffset,
+        /// 字节流的实际长度。
         actual_size: usize,
     },
+    /// 某个分段的 offset/size 超出 blob 范围。
     SectionOutOfRange {
+        /// 越界分段名称（如 "nodes"/"edges"）。
         section: &'static str,
-        offset: u32,
+        /// 分段起始偏移。
+        offset: ByteOffset,
+        /// 分段字节大小。
         size: usize,
+        /// blob 总字节数。
         total_size: usize,
     },
+    /// 元素数量与大小相乘时溢出。
     CountOverflow,
 }
 
+/// 把一个 `Copy` 值的原始字节追加到 buffer 末尾。
 fn append_repr<T: Copy>(bytes: &mut Vec<u8>, value: &T) {
     let src = unsafe {
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), mem::size_of::<T>())
@@ -461,6 +569,7 @@ fn append_repr<T: Copy>(bytes: &mut Vec<u8>, value: &T) {
     bytes.extend_from_slice(src);
 }
 
+/// 把一个 `Copy` 切片的原始字节追加到 buffer 末尾。
 fn append_repr_slice<T: Copy>(bytes: &mut Vec<u8>, values: &[T]) {
     let src = unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), mem::size_of_val(values))
@@ -468,6 +577,7 @@ fn append_repr_slice<T: Copy>(bytes: &mut Vec<u8>, values: &[T]) {
     bytes.extend_from_slice(src);
 }
 
+/// 在指定 offset 处原地覆盖写入一个 `Copy` 值的原始字节。
 fn write_repr_at<T: Copy>(bytes: &mut [u8], offset: usize, value: &T) {
     let src = unsafe {
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), mem::size_of::<T>())
@@ -475,6 +585,7 @@ fn write_repr_at<T: Copy>(bytes: &mut [u8], offset: usize, value: &T) {
     bytes[offset..offset + src.len()].copy_from_slice(src);
 }
 
+/// 从指定 offset 处非对齐读取一个 `Copy` 值，越界时返回 `TooSmall`。
 fn read_repr_at<T: Copy>(bytes: &[u8], offset: usize) -> Result<T, AiGraphParseError> {
     let end = offset
         .checked_add(mem::size_of::<T>())
@@ -485,6 +596,7 @@ fn read_repr_at<T: Copy>(bytes: &[u8], offset: usize) -> Result<T, AiGraphParseE
     Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<T>()) })
 }
 
+/// 连续读取 `count` 个 `Copy` 值到一个 `Vec`。
 fn read_repr_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>, AiGraphParseError> {
     let expected = count
         .checked_mul(mem::size_of::<T>())
@@ -500,60 +612,57 @@ fn read_repr_vec<T: Copy>(bytes: &[u8], count: usize) -> Result<Vec<T>, AiGraphP
     Ok(out)
 }
 
-fn pad_to(bytes: &mut Vec<u8>, align: usize) -> Result<u32, AiGraphBuildError> {
+/// 用 0 填充 buffer 到 `align` 对齐边界，返回对齐后的偏移。
+fn pad_to(bytes: &mut Vec<u8>, align: usize) -> Result<ByteOffset, AiGraphBuildError> {
     let padding = (align - (bytes.len() % align)) % align;
     let new_len = bytes
         .len()
         .checked_add(padding)
         .ok_or(AiGraphBuildError::SizeOverflow)?;
     bytes.resize(new_len, 0);
-    u32::try_from(bytes.len()).map_err(|_| AiGraphBuildError::SizeOverflow)
+    Ok(ByteOffset::new(
+        u32::try_from(bytes.len()).map_err(|_| AiGraphBuildError::SizeOverflow)?,
+    ))
 }
 
+/// 校验 `offset + count * item_size` 落在 blob 内，返回该分段的字节范围。
 fn checked_section(
     section: &'static str,
     total_size: usize,
-    offset: u32,
-    count: u32,
+    offset: ByteOffset,
+    count: usize,
     item_size: usize,
 ) -> Result<core::ops::Range<usize>, AiGraphParseError> {
-    let size = (count as usize)
+    let size = count
         .checked_mul(item_size)
         .ok_or(AiGraphParseError::CountOverflow)?;
-    let start = offset as usize;
-    let end = start
-        .checked_add(size)
-        .ok_or(AiGraphParseError::CountOverflow)?;
-    if end > total_size {
-        return Err(AiGraphParseError::SectionOutOfRange {
+    match offset.checked_range(size, total_size) {
+        Ok(range) => Ok(range),
+        Err(crate::AbiTypeError::CountOverflow) => Err(AiGraphParseError::CountOverflow),
+        Err(_) => Err(AiGraphParseError::SectionOutOfRange {
             section,
             offset,
             size,
             total_size,
-        });
+        }),
     }
-    Ok(start..end)
 }
 
+/// 序列化前校验：节点 id 连续、边端点合法、且整图无环。
 fn validate_graph(nodes: &[AiGraphNode], edges: &[AiGraphEdge]) -> Result<(), AiGraphBuildError> {
     for (idx, node) in nodes.iter().enumerate() {
-        if node.node_id != idx as u32 {
-            return Err(AiGraphBuildError::InvalidDepend(AiGraphNodeId(
-                node.node_id,
-            )));
+        let expected = AiGraphNodeId::new(idx as u32);
+        if node.node_id != expected {
+            return Err(AiGraphBuildError::InvalidDepend(node.node_id));
         }
     }
 
     for edge in edges {
-        if edge.from_node as usize >= nodes.len() {
-            return Err(AiGraphBuildError::InvalidDepend(AiGraphNodeId(
-                edge.from_node,
-            )));
+        if edge.from_node.as_usize() >= nodes.len() {
+            return Err(AiGraphBuildError::InvalidDepend(edge.from_node));
         }
-        if edge.to_node as usize >= nodes.len() {
-            return Err(AiGraphBuildError::InvalidDepend(AiGraphNodeId(
-                edge.to_node,
-            )));
+        if edge.to_node.as_usize() >= nodes.len() {
+            return Err(AiGraphBuildError::InvalidDepend(edge.to_node));
         }
     }
 
@@ -564,13 +673,14 @@ fn validate_graph(nodes: &[AiGraphNode], edges: &[AiGraphEdge]) -> Result<(), Ai
     Ok(())
 }
 
+/// 用 Kahn 拓扑排序判断整图是否存在环。
 fn has_cycle(node_count: usize, edges: &[AiGraphEdge]) -> bool {
     let mut indegree = vec![0_usize; node_count];
     let mut outgoing = vec![Vec::new(); node_count];
 
     for edge in edges {
-        let from = edge.from_node as usize;
-        let to = edge.to_node as usize;
+        let from = edge.from_node.as_usize();
+        let to = edge.to_node.as_usize();
         outgoing[from].push(to);
         indegree[to] += 1;
     }
@@ -599,12 +709,155 @@ fn has_cycle(node_count: usize, edges: &[AiGraphEdge]) -> bool {
 const _: () = assert!(core::mem::align_of::<AiGraphSubmitEntry>() == 64);
 const _: () = assert!(core::mem::align_of::<AiGraphNode>() == 64);
 
+/// ABI raw mirror layout checks for graph structures touched by transparent newtypes.
+#[allow(dead_code, missing_docs, clippy::missing_docs_in_private_items)]
+mod abi_layout {
+    use super::*;
+
+    #[repr(C, align(64))]
+    struct RawAiGraphSubmitEntry {
+        abi_version: u32,
+        submit_kind: u32,
+        flags: u32,
+        reserved0: u32,
+        user_token: u32,
+        graph_user_va: u64,
+        graph_size: u64,
+    }
+
+    #[repr(C)]
+    struct RawAiGraphHeader {
+        magic: u32,
+        total_size: u32,
+        flags: u32,
+        node_count: u32,
+        edge_count: u32,
+        nodes_offset: u32,
+        edges_offset: u32,
+    }
+
+    #[repr(C)]
+    struct RawAiGraphState {
+        complete: bool,
+        error_flag: u8,
+    }
+
+    #[repr(C)]
+    struct RawAiGraphNode {
+        node_id: u32,
+        desc: AiKernelDesc,
+        state: RawAiGraphState,
+    }
+
+    #[repr(C)]
+    struct RawAiGraphEdge {
+        from_node: u32,
+        to_node: u32,
+    }
+
+    const _: () = assert!(
+        core::mem::size_of::<AiGraphSubmitEntry>() == core::mem::size_of::<RawAiGraphSubmitEntry>()
+    );
+    const _: () = assert!(
+        core::mem::align_of::<AiGraphSubmitEntry>()
+            == core::mem::align_of::<RawAiGraphSubmitEntry>()
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphSubmitEntry, flags)
+            == core::mem::offset_of!(RawAiGraphSubmitEntry, flags)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphSubmitEntry, user_token)
+            == core::mem::offset_of!(RawAiGraphSubmitEntry, user_token)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphSubmitEntry, graph_user_va)
+            == core::mem::offset_of!(RawAiGraphSubmitEntry, graph_user_va)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphSubmitEntry, graph_size)
+            == core::mem::offset_of!(RawAiGraphSubmitEntry, graph_size)
+    );
+
+    const _: () =
+        assert!(core::mem::size_of::<AiGraphHeader>() == core::mem::size_of::<RawAiGraphHeader>());
+    const _: () = assert!(
+        core::mem::align_of::<AiGraphHeader>() == core::mem::align_of::<RawAiGraphHeader>()
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphHeader, total_size)
+            == core::mem::offset_of!(RawAiGraphHeader, total_size)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphHeader, flags)
+            == core::mem::offset_of!(RawAiGraphHeader, flags)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphHeader, node_count)
+            == core::mem::offset_of!(RawAiGraphHeader, node_count)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphHeader, edge_count)
+            == core::mem::offset_of!(RawAiGraphHeader, edge_count)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphHeader, nodes_offset)
+            == core::mem::offset_of!(RawAiGraphHeader, nodes_offset)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphHeader, edges_offset)
+            == core::mem::offset_of!(RawAiGraphHeader, edges_offset)
+    );
+
+    const _: () =
+        assert!(core::mem::size_of::<AiGraphState>() == core::mem::size_of::<RawAiGraphState>());
+    const _: () =
+        assert!(core::mem::align_of::<AiGraphState>() == core::mem::align_of::<RawAiGraphState>());
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphState, complete)
+            == core::mem::offset_of!(RawAiGraphState, complete)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphState, error_flag)
+            == core::mem::offset_of!(RawAiGraphState, error_flag)
+    );
+
+    const _: () =
+        assert!(core::mem::size_of::<AiGraphNode>() == core::mem::size_of::<RawAiGraphNode>());
+    const _: () =
+        assert!(core::mem::align_of::<AiGraphNode>() == core::mem::align_of::<RawAiGraphNode>());
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphNode, node_id)
+            == core::mem::offset_of!(RawAiGraphNode, node_id)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphNode, desc) == core::mem::offset_of!(RawAiGraphNode, desc)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphNode, state) == core::mem::offset_of!(RawAiGraphNode, state)
+    );
+
+    const _: () =
+        assert!(core::mem::size_of::<AiGraphEdge>() == core::mem::size_of::<RawAiGraphEdge>());
+    const _: () =
+        assert!(core::mem::align_of::<AiGraphEdge>() == core::mem::align_of::<RawAiGraphEdge>());
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphEdge, from_node)
+            == core::mem::offset_of!(RawAiGraphEdge, from_node)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiGraphEdge, to_node)
+            == core::mem::offset_of!(RawAiGraphEdge, to_node)
+    );
+}
+
+/// graph 构建与解析的单元测试。
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 基础插入测试。
     #[test]
-    ///基础插入测试
     fn build_parse_chain() {
         let mut graph = GraphManager::new();
 
@@ -628,8 +881,8 @@ mod tests {
         assert_eq!(parsed.edges[0].to_node, 1);
     }
 
+    /// 坏节点检测。
     #[test]
-    /// 坏节点检测
     fn reject_bad_depend() {
         let mut graph = GraphManager::new();
         let err = graph
@@ -638,8 +891,8 @@ mod tests {
         assert_eq!(err, AiGraphBuildError::InvalidDepend(AiGraphNodeId(99)));
     }
 
+    /// 多依赖图测试。
     #[test]
-    /// 多依赖图测试
     fn build_parse_join_and_fork() {
         let mut graph = GraphManager::new();
 
@@ -672,8 +925,8 @@ mod tests {
         assert_eq!(parsed.edges[3].from_node, b.0);
     }
 
+    /// 环检测。
     #[test]
-    /// 环检测
     fn reject_cycle_edge_insert() {
         let mut graph = GraphManager::new();
 

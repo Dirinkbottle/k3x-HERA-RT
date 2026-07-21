@@ -9,6 +9,10 @@ use crate::{MAX_DIM, MAX_SUBMIT_TENSORS};
 
 use super::kernel::{AiTargetHint, KernelOp};
 use super::kernelattr::AiKernelAttr;
+use super::types::{
+    AttrByteSize, ByteSize, ByteStride, CompletionStatus, CompletionUserToken, DimCount, DimSize,
+    KernelVa, TensorCount, TensorFlags, UserVa,
+};
 
 /// tensor 元素类型。
 ///
@@ -21,17 +25,28 @@ pub struct AiDtype(pub u32);
 /// 内联算子参数区大小。
 pub const ATTR_INLINE_SIZE: usize = 128;
 impl AiDtype {
+    /// 32 位单精度浮点。
     pub const F32: Self = Self(0);
+    /// 16 位半精度浮点 (IEEE)。
     pub const F16: Self = Self(1);
+    /// 16 位 bfloat。
     pub const BF16: Self = Self(2);
+    /// 8 位有符号整数。
     pub const I8: Self = Self(3);
+    /// 8 位无符号整数。
     pub const U8: Self = Self(4);
+    /// 32 位有符号整数。
     pub const I32: Self = Self(5);
+    /// 64 位有符号整数。
     pub const I64: Self = Self(6);
+    /// 布尔值，占 1 字节。
     pub const BOOL: Self = Self(7);
 
+    /// ggml Q4_0 量化格式。
     pub const Q4_0: Self = Self(100);
+    /// ggml Q4_K 量化格式。
     pub const Q4_K: Self = Self(101);
+    /// ggml Q8_0 量化格式。
     pub const Q8_0: Self = Self(102);
 
     /// 固定宽度 dtype 的单元素字节数。
@@ -55,9 +70,13 @@ impl AiDtype {
 pub struct AiTensorFormat(pub u32);
 
 impl AiTensorFormat {
+    /// 不限格式，由 backend 自行推断。
     pub const ANY: Self = Self(0);
+    /// batch-channel-height-width，最常见的 CNN 格式。
     pub const NCHW: Self = Self(1);
+    /// batch-height-width-channel，移动端友好格式。
     pub const NHWC: Self = Self(2);
+    /// batch-channel-depth-height-width，3D 卷积格式。
     pub const NCDHW: Self = Self(3);
 }
 
@@ -69,9 +88,13 @@ impl AiTensorFormat {
 pub struct AiTensorLayout(pub u32);
 
 impl AiTensorLayout {
+    /// 密集布局，元素连续排列。
     pub const DENSE: Self = Self(0);
+    /// 带 stride 布局，允许子张量视图。
     pub const STRIDED: Self = Self(1);
+    /// 分块布局，用于 blocked matmul 等优化场景。
     pub const BLOCKED: Self = Self(2);
+    /// ggml 量化格式，需配合 `AiQuantDesc` 解释。
     pub const GGML_QUANT: Self = Self(3);
 }
 
@@ -81,11 +104,17 @@ impl AiTensorLayout {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AiQuantDesc {
+    /// 反量化缩放系数。
     pub scale: f32,
+    /// 零点偏移，对称量化时为 0。
     pub zero_point: i32,
-    pub block_size: u32,
+    /// 量化 block 内元素个数。
+    pub block_size: DimSize,
+    /// scale 值本身的数据类型。
     pub scale_dtype: AiDtype,
-    pub flags: u32,
+    /// 量化 flags，具体含义由 backend 约定。
+    pub flags: TensorFlags,
+    /// 预留字段，保持 ABI 可扩展。
     pub reserved: [u32; 3],
 }
 
@@ -97,13 +126,13 @@ pub struct AiQuantDesc {
 #[derive(Clone, Copy, Default)]
 pub struct AiTensorDesc {
     /// 用户态虚拟地址。
-    pub user_va: u64,
+    pub user_va: UserVa,
 
     /// 内核态虚拟地址。 由内核创建alias后填写
-    pub kernel_va: u64,
+    pub kernel_va: KernelVa,
 
     /// 该 tensor 可访问的完整 buffer 字节数。
-    pub size_bytes: u64,
+    pub size_bytes: ByteSize,
 
     /// 元素类型，未知值必须被内核拒绝或走 fallback。
     pub dtype: AiDtype,
@@ -115,20 +144,20 @@ pub struct AiTensorDesc {
     pub layout: AiTensorLayout,
 
     /// 实际维度数量，必须满足 `ndim <= MAX_DIM`。
-    pub ndim: u32,
+    pub ndim: DimCount,
 
     /// tensor flags。具体含义由 frontend/backend 约定。
     /// TODO:
-    pub flags: u8,
+    pub flags: TensorFlags,
 
     /// 预留字段，ABI 扩展留空间。
     pub reserved0: u32,
 
     /// 每个维度的元素数量。
-    pub shape: [u32; MAX_DIM],
+    pub shape: [DimSize; MAX_DIM],
 
     /// 每个维度前进 1 个元素时跨过的字节数。
-    pub stride_bytes: [u64; MAX_DIM],
+    pub stride_bytes: [ByteStride; MAX_DIM],
 
     /// 量化补充信息。
     pub quant: AiQuantDesc,
@@ -139,13 +168,13 @@ impl AiTensorDesc {
     ///
     /// 这里不分配内存，只把用户态地址、shape、dtype 等语义收敛成稳定 ABI。
     pub fn from_user_buffer(
-        user_va: u64,
-        size_bytes: u64,
+        user_va: UserVa,
+        size_bytes: ByteSize,
         dtype: AiDtype,
         format: AiTensorFormat,
         layout: AiTensorLayout,
-        shape: &[u32],
-        flags: u8,
+        shape: &[DimSize],
+        flags: TensorFlags,
     ) -> Self {
         assert!(shape.len() <= MAX_DIM);
 
@@ -153,7 +182,7 @@ impl AiTensorDesc {
             .element_size_bytes()
             .expect("quantized or unknown dtype needs explicit size path");
         let required_size = tensor_size_bytes(shape, element_size);
-        assert!(size_bytes >= required_size);
+        assert!(size_bytes.get() >= required_size.get());
 
         let mut desc = Self {
             user_va,
@@ -161,7 +190,7 @@ impl AiTensorDesc {
             dtype,
             format,
             layout,
-            ndim: shape.len() as u32,
+            ndim: DimCount::new(shape.len() as u32),
             flags,
             ..Self::default()
         };
@@ -170,9 +199,9 @@ impl AiTensorDesc {
         if !shape.is_empty() {
             let mut stride = element_size as u64;
             for dim_idx in (0..shape.len()).rev() {
-                desc.stride_bytes[dim_idx] = stride;
+                desc.stride_bytes[dim_idx] = ByteStride::new(stride);
                 stride = stride
-                    .checked_mul(shape[dim_idx] as u64)
+                    .checked_mul(shape[dim_idx].get() as u64)
                     .expect("tensor stride overflow");
             }
         }
@@ -181,14 +210,16 @@ impl AiTensorDesc {
 }
 
 /// 计算 tensor 数据总字节数：各维度元素数之积 × 单元素字节数。
-pub fn tensor_size_bytes(shape: &[u32], element_size: u32) -> u64 {
+pub fn tensor_size_bytes(shape: &[DimSize], element_size: u32) -> ByteSize {
     let element_count = shape.iter().fold(1_u64, |acc, dim| {
-        acc.checked_mul(*dim as u64)
+        acc.checked_mul(dim.get() as u64)
             .expect("tensor element count overflow")
     });
-    element_count
-        .checked_mul(element_size as u64)
-        .expect("tensor byte size overflow")
+    ByteSize::new(
+        element_count
+            .checked_mul(element_size as u64)
+            .expect("tensor byte size overflow"),
+    )
 }
 
 /// 单个 lowered 算子的稳定描述。
@@ -204,10 +235,10 @@ pub struct AiKernelDesc {
     pub target_hint: AiTargetHint,
 
     /// 输入 tensor 数量。输入必须放在 tensors 数组前部。
-    pub input_count: u32,
+    pub input_count: TensorCount,
 
     /// 输出 tensor 数量。输出紧跟在输入 tensor 后面。
-    pub output_count: u32,
+    pub output_count: TensorCount,
 
     /// 输入和输出 tensor 描述数组。
     /// 从[0..input_count)是输入tensor,[input_count..input_count+output_count)是输出tensor
@@ -217,7 +248,7 @@ pub struct AiKernelDesc {
     pub reserved0: u32,
 
     /// attr_inline 中有效字节数。
-    pub attr_size: u32,
+    pub attr_size: AttrByteSize,
 
     /// 内联算子参数。
     ///
@@ -231,11 +262,11 @@ impl Default for AiKernelDesc {
             op: KernelOp::INVALID,
             target_hint: AiTargetHint::AUTO,
 
-            input_count: 0,
-            output_count: 0,
+            input_count: TensorCount::new(0),
+            output_count: TensorCount::new(0),
             tensors: [AiTensorDesc::default(); MAX_SUBMIT_TENSORS],
             reserved0: 0,
-            attr_size: 0,
+            attr_size: AttrByteSize::new(0),
             attr_inline: [0; ATTR_INLINE_SIZE],
         }
     }
@@ -249,8 +280,8 @@ impl AiKernelDesc {
     pub fn new<T: AiKernelAttr>(
         attr: &T,
         target_hint: AiTargetHint,
-        input_count: u32,
-        output_count: u32,
+        input_count: TensorCount,
+        output_count: TensorCount,
         tensors: &[AiTensorDesc],
     ) -> Self {
         Self::new_with_op(T::OP, attr, target_hint, input_count, output_count, tensors)
@@ -263,14 +294,13 @@ impl AiKernelDesc {
         op: KernelOp,
         attr: &T,
         target_hint: AiTargetHint,
-        input_count: u32,
-        output_count: u32,
+        input_count: TensorCount,
+        output_count: TensorCount,
         tensors: &[AiTensorDesc],
     ) -> Self {
         let total_count = input_count
-            .checked_add(output_count)
+            .checked_total(output_count)
             .expect("tensor count overflow");
-        let total_count = usize::try_from(total_count).expect("tensor count does not fit usize");
 
         assert!(total_count <= MAX_SUBMIT_TENSORS);
         assert!(tensors.len() == total_count);
@@ -294,7 +324,7 @@ impl AiKernelDesc {
         let size = core::mem::size_of::<T>();
         assert!(size <= ATTR_INLINE_SIZE);
 
-        self.attr_size = size as u32;
+        self.attr_size = AttrByteSize::new(size as u32);
         self.attr_inline = [0; ATTR_INLINE_SIZE];
 
         unsafe {
@@ -312,10 +342,10 @@ impl AiKernelDesc {
 #[derive(Clone, Copy, Default)]
 pub struct AiCompletionEntry {
     /// submit 时传入的 token，完成时原样返回。
-    pub user_token: u64,
+    pub user_token: CompletionUserToken,
 
     /// 0 表示成功；负数可以对齐内核 errno 风格错误码。
-    pub status: i32,
+    pub status: CompletionStatus,
 
     /// 预留扩展字段。
     pub reserved0: u8,
@@ -326,3 +356,139 @@ pub struct AiCompletionEntry {
 const _: () = assert!(core::mem::align_of::<AiKernelDesc>() == 64);
 const _: () = assert!(core::mem::align_of::<AiCompletionEntry>() == 64);
 const _: () = assert!(core::mem::offset_of!(AiKernelDesc, attr_inline) % 8 == 0);
+
+/// ABI raw mirror layout checks for transparent newtype field replacements.
+#[allow(dead_code, missing_docs, clippy::missing_docs_in_private_items)]
+mod abi_layout {
+    use super::*;
+
+    #[repr(C)]
+    struct RawAiQuantDesc {
+        scale: f32,
+        zero_point: i32,
+        block_size: u32,
+        scale_dtype: u32,
+        flags: u8,
+        reserved: [u32; 3],
+    }
+
+    #[repr(C)]
+    struct RawAiTensorDesc {
+        user_va: u64,
+        kernel_va: u64,
+        size_bytes: u64,
+        dtype: u32,
+        format: u32,
+        layout: u32,
+        ndim: u32,
+        flags: u8,
+        reserved0: u32,
+        shape: [u32; MAX_DIM],
+        stride_bytes: [u64; MAX_DIM],
+        quant: RawAiQuantDesc,
+    }
+
+    #[repr(C, align(64))]
+    struct RawAiKernelDesc {
+        op: u8,
+        target_hint: u8,
+        input_count: u32,
+        output_count: u32,
+        tensors: [RawAiTensorDesc; MAX_SUBMIT_TENSORS],
+        reserved0: u32,
+        attr_size: u32,
+        attr_inline: [u8; ATTR_INLINE_SIZE],
+    }
+
+    #[repr(C, align(64))]
+    struct RawAiCompletionEntry {
+        user_token: u64,
+        status: i32,
+        reserved0: u8,
+    }
+
+    const _: () =
+        assert!(core::mem::size_of::<AiQuantDesc>() == core::mem::size_of::<RawAiQuantDesc>());
+    const _: () =
+        assert!(core::mem::align_of::<AiQuantDesc>() == core::mem::align_of::<RawAiQuantDesc>());
+    const _: () = assert!(
+        core::mem::offset_of!(AiQuantDesc, block_size)
+            == core::mem::offset_of!(RawAiQuantDesc, block_size)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiQuantDesc, flags) == core::mem::offset_of!(RawAiQuantDesc, flags)
+    );
+
+    const _: () =
+        assert!(core::mem::size_of::<AiTensorDesc>() == core::mem::size_of::<RawAiTensorDesc>());
+    const _: () =
+        assert!(core::mem::align_of::<AiTensorDesc>() == core::mem::align_of::<RawAiTensorDesc>());
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, user_va)
+            == core::mem::offset_of!(RawAiTensorDesc, user_va)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, kernel_va)
+            == core::mem::offset_of!(RawAiTensorDesc, kernel_va)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, size_bytes)
+            == core::mem::offset_of!(RawAiTensorDesc, size_bytes)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, ndim) == core::mem::offset_of!(RawAiTensorDesc, ndim)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, flags) == core::mem::offset_of!(RawAiTensorDesc, flags)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, shape) == core::mem::offset_of!(RawAiTensorDesc, shape)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, stride_bytes)
+            == core::mem::offset_of!(RawAiTensorDesc, stride_bytes)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiTensorDesc, quant) == core::mem::offset_of!(RawAiTensorDesc, quant)
+    );
+
+    const _: () =
+        assert!(core::mem::size_of::<AiKernelDesc>() == core::mem::size_of::<RawAiKernelDesc>());
+    const _: () =
+        assert!(core::mem::align_of::<AiKernelDesc>() == core::mem::align_of::<RawAiKernelDesc>());
+    const _: () = assert!(
+        core::mem::offset_of!(AiKernelDesc, input_count)
+            == core::mem::offset_of!(RawAiKernelDesc, input_count)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiKernelDesc, output_count)
+            == core::mem::offset_of!(RawAiKernelDesc, output_count)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiKernelDesc, tensors)
+            == core::mem::offset_of!(RawAiKernelDesc, tensors)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiKernelDesc, attr_size)
+            == core::mem::offset_of!(RawAiKernelDesc, attr_size)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiKernelDesc, attr_inline)
+            == core::mem::offset_of!(RawAiKernelDesc, attr_inline)
+    );
+
+    const _: () = assert!(
+        core::mem::size_of::<AiCompletionEntry>() == core::mem::size_of::<RawAiCompletionEntry>()
+    );
+    const _: () = assert!(
+        core::mem::align_of::<AiCompletionEntry>() == core::mem::align_of::<RawAiCompletionEntry>()
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiCompletionEntry, user_token)
+            == core::mem::offset_of!(RawAiCompletionEntry, user_token)
+    );
+    const _: () = assert!(
+        core::mem::offset_of!(AiCompletionEntry, status)
+            == core::mem::offset_of!(RawAiCompletionEntry, status)
+    );
+}

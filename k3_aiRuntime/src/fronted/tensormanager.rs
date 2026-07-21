@@ -4,14 +4,19 @@
 //! `TensorManager` 负责分配一块稳定的用户态 buffer，并生成配套 `AiTensorDesc`。
 
 use super::kd_uring::MmapMemory;
-use k3_aiUabi::{AiDtype, AiTensorDesc, AiTensorFormat, AiTensorLayout, tensor_size_bytes};
-use k3_aiUabi::error::AiRuntimeErr;
+use k3_ai_uabi::error::AiRuntimeErr;
+use k3_ai_uabi::{
+    AiDtype, AiTensorDesc, AiTensorFormat, AiTensorLayout, ByteSize, DimSize, MAX_DIM, TensorFlags,
+    UserVa, tensor_size_bytes,
+};
 
 /// 用户态 tensor 句柄。
 ///
 /// `storage` 是 MAP_SHARED mmap 内存，`desc.user_va` 把这块内存暴露给 graph/kernel ABI。
 pub struct Tensor {
+    /// 提交给 graph/kernel ABI 的稳定描述。
     desc: AiTensorDesc,
+    /// 承载 tensor 数据的 MAP_SHARED mmap 内存。
     storage: MmapMemory,
 }
 
@@ -22,12 +27,12 @@ impl Tensor {
     }
 
     /// 数据区用户态虚拟地址。
-    pub fn user_va(&self) -> u64 {
+    pub fn user_va(&self) -> UserVa {
         self.desc.user_va
     }
 
     /// 数据区总字节数。
-    pub fn size_bytes(&self) -> u64 {
+    pub fn size_bytes(&self) -> ByteSize {
         self.desc.size_bytes
     }
 
@@ -37,8 +42,8 @@ impl Tensor {
     }
 
     /// 当前张量的维度视图。
-    pub fn shape(&self) -> &[u32] {
-        &self.desc.shape[..self.desc.ndim as usize]
+    pub fn shape(&self) -> &[DimSize] {
+        &self.desc.shape[..self.desc.ndim.get() as usize]
     }
 
     /// 原始字节只读视图。
@@ -58,7 +63,11 @@ impl Tensor {
     /// 当前 demo 和 matmul 用例只先接 F32，其他 dtype 后面再各自补。
     pub fn as_f32_slice(&self) -> &[f32] {
         assert!(self.desc.dtype == AiDtype::F32);
-        assert!(self.storage.len() % core::mem::size_of::<f32>() == 0);
+        assert!(
+            self.storage
+                .len()
+                .is_multiple_of(core::mem::size_of::<f32>())
+        );
 
         unsafe {
             core::slice::from_raw_parts(
@@ -71,7 +80,11 @@ impl Tensor {
     /// F32 可写视图。
     pub fn as_f32_mut_slice(&mut self) -> &mut [f32] {
         assert!(self.desc.dtype == AiDtype::F32);
-        assert!(self.storage.len() % core::mem::size_of::<f32>() == 0);
+        assert!(
+            self.storage
+                .len()
+                .is_multiple_of(core::mem::size_of::<f32>())
+        );
 
         unsafe {
             core::slice::from_raw_parts_mut(
@@ -109,18 +122,25 @@ impl TensorManager {
         let element_size = dtype
             .element_size_bytes()
             .ok_or(AiRuntimeErr::InvalidInput)?;
-        let size_bytes = tensor_size_bytes(shape, element_size);
-        let size_bytes = usize::try_from(size_bytes).map_err(|_| AiRuntimeErr::InvalidShape)?;
+        if shape.len() > MAX_DIM {
+            return Err(AiRuntimeErr::InvalidShape);
+        }
+        let shape_dims: Vec<DimSize> = shape.iter().copied().map(DimSize::new).collect();
+        let size_bytes = tensor_size_bytes(&shape_dims, element_size);
+        let alloc_size = size_bytes
+            .try_as_usize()
+            .map_err(|_| AiRuntimeErr::InvalidShape)?;
 
-        let mut storage = MmapMemory::new_shared(size_bytes).map_err(|_| AiRuntimeErr::AllocFailed)?;
+        let mut storage =
+            MmapMemory::new_shared(alloc_size).map_err(|_| AiRuntimeErr::AllocFailed)?;
         let desc = AiTensorDesc::from_user_buffer(
-            storage.as_mut_ptr() as u64,
-            storage.len() as u64,
+            UserVa::new(storage.as_mut_ptr() as u64),
+            ByteSize::new(storage.len() as u64),
             dtype,
             format,
             layout,
-            shape,
-            flags,
+            &shape_dims,
+            TensorFlags::new(flags),
         );
 
         Ok(Tensor { desc, storage })

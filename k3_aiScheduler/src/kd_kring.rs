@@ -112,8 +112,8 @@
 
 use alloc::vec;
 use alloc::{collections::vec_deque::VecDeque, vec::Vec};
-use k3_aiUabi::error::SchedulerErr;
-use k3_aiUabi::{AiGraphNode, AiParsedGraph};
+use k3_ai_uabi::error::SchedulerErr;
+use k3_ai_uabi::{AiGraphNode, AiGraphNodeId, AiParsedGraph};
 
 /// 内核侧把一张 DAG 收敛成的单条调度链。
 ///
@@ -124,22 +124,24 @@ pub struct TaskLink {
     /// 提交该 graph 的进程。
     pub pid: u32,
     /// 链头 node id。空图时为 `None`。
-    pub head_node: Option<u32>,
+    pub head_node: Option<AiGraphNodeId>,
     /// 链尾 node id。空图时为 `None`。
-    pub tail_node: Option<u32>,
+    pub tail_node: Option<AiGraphNodeId>,
     /// `next_node[node_id]` 表示当前直链里下一个节点是谁。
-    pub next_node: Vec<Option<u32>>,
+    pub next_node: Vec<Option<AiGraphNodeId>>,
     /// 解析出的稳定拓扑序。
-    pub node_order: Vec<u32>,
+    pub node_order: Vec<AiGraphNodeId>,
     /// 直链对应的节点副本，顺序与 `node_order` 一致。
     pub ordered_nodes: Vec<AiGraphNode>,
 }
 
 impl TaskLink {
+    /// 按调度顺序遍历直链中的节点。
     pub fn iter(&self) -> impl Iterator<Item = &AiGraphNode> {
         self.ordered_nodes.iter()
     }
 
+    /// 弹出并返回链首节点，链空时返回 `None`。
     pub fn pop_front(&mut self) -> Option<AiGraphNode> {
         if self.ordered_nodes.is_empty() {
             None
@@ -163,14 +165,14 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
     let mut outgoing = vec![Vec::new(); node_count];
 
     for (idx, node) in graph.nodes.iter().enumerate() {
-        if node.node_id != idx as u32 {
+        if node.node_id != AiGraphNodeId::new(idx as u32) {
             return Err(SchedulerErr::ParseFailed);
         }
     }
 
     for edge in &graph.edges {
-        let from = edge.from_node as usize;
-        let to = edge.to_node as usize;
+        let from = edge.from_node.as_usize();
+        let to = edge.to_node.as_usize();
         if from >= node_count || to >= node_count {
             return Err(SchedulerErr::ParseFailed);
         }
@@ -182,7 +184,7 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
     let mut ready = VecDeque::new();
     for (idx, degree) in indegree.iter().enumerate() {
         if *degree == 0 {
-            ready.push_back(idx as u32);
+            ready.push_back(AiGraphNodeId::new(idx as u32));
         }
     }
 
@@ -190,8 +192,8 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
     while let Some(node_id) = ready.pop_front() {
         node_order.push(node_id);
 
-        for &next_node in &outgoing[node_id as usize] {
-            let next_idx = next_node as usize;
+        for &next_node in &outgoing[node_id.as_usize()] {
+            let next_idx = next_node.as_usize();
             indegree[next_idx] -= 1;
             if indegree[next_idx] == 0 {
                 ready.push_back(next_node);
@@ -205,12 +207,12 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
 
     let mut next_node = vec![None; node_count];
     for window in node_order.windows(2) {
-        next_node[window[0] as usize] = Some(window[1]);
+        next_node[window[0].as_usize()] = Some(window[1]);
     }
 
     let mut ordered_nodes = Vec::with_capacity(node_count);
     for &node_id in &node_order {
-        ordered_nodes.push(graph.nodes[node_id as usize]);
+        ordered_nodes.push(graph.nodes[node_id.as_usize()]);
     }
 
     Ok(TaskLink {
@@ -223,12 +225,14 @@ pub fn resolve_parsed_graph(pid: u32, graph: &AiParsedGraph) -> Result<TaskLink,
     })
 }
 
+/// graph 收敛为调度直链的单元测试。
 #[cfg(test)]
 mod tests {
-    use k3_aiUabi::{AiGraphBuildError, AiGraphEdge, AiGraphParser, AiKernelDesc, GraphManager};
+    use k3_ai_uabi::{AiGraphBuildError, AiGraphEdge, AiGraphParser, AiKernelDesc, GraphManager};
 
     use super::*;
 
+    /// 用闭包构建并解析一张 graph，返回解析后的结果供测试断言。
     fn build_graph<F>(f: F) -> AiParsedGraph
     where
         F: FnOnce(&mut GraphManager) -> Result<(), AiGraphBuildError>,
@@ -239,6 +243,7 @@ mod tests {
         AiGraphParser::parse(blob.as_bytes()).expect("graph parse should succeed")
     }
 
+    /// 直链应保持 edge 定义的先后顺序。
     #[test]
     fn resolve_chain_keeps_edge_order() {
         let parsed = build_graph(|graph| {
@@ -251,14 +256,22 @@ mod tests {
         let link = resolve_parsed_graph(7, &parsed).expect("resolve graph should succeed");
 
         assert_eq!(link.pid, 7);
-        assert_eq!(link.node_order, vec![0, 1, 2]);
-        assert_eq!(link.head_node, Some(0));
-        assert_eq!(link.tail_node, Some(2));
-        assert_eq!(link.next_node[0], Some(1));
-        assert_eq!(link.next_node[1], Some(2));
+        assert_eq!(
+            link.node_order,
+            vec![
+                AiGraphNodeId::new(0),
+                AiGraphNodeId::new(1),
+                AiGraphNodeId::new(2)
+            ]
+        );
+        assert_eq!(link.head_node, Some(AiGraphNodeId::new(0)));
+        assert_eq!(link.tail_node, Some(AiGraphNodeId::new(2)));
+        assert_eq!(link.next_node[0], Some(AiGraphNodeId::new(1)));
+        assert_eq!(link.next_node[1], Some(AiGraphNodeId::new(2)));
         assert_eq!(link.next_node[2], None);
     }
 
+    /// 汇聚+分叉图收敛后应满足所有依赖约束。
     #[test]
     fn resolve_join_and_fork_respects_dependencies() {
         let parsed = build_graph(|graph| {
@@ -297,6 +310,7 @@ mod tests {
         }
     }
 
+    /// 越界 edge 应被拒绝。
     #[test]
     fn reject_out_of_range_edge() {
         let mut parsed = build_graph(|graph| {
@@ -304,8 +318,8 @@ mod tests {
             Ok(())
         });
         parsed.edges.push(AiGraphEdge {
-            from_node: 0,
-            to_node: 3,
+            from_node: AiGraphNodeId::new(0),
+            to_node: AiGraphNodeId::new(3),
         });
 
         match resolve_parsed_graph(1, &parsed) {
@@ -314,6 +328,7 @@ mod tests {
         }
     }
 
+    /// 含环的 edge 集应被拒绝。
     #[test]
     fn reject_cycle_by_edges() {
         let mut parsed = build_graph(|graph| {
@@ -323,8 +338,8 @@ mod tests {
             Ok(())
         });
         parsed.edges.push(AiGraphEdge {
-            from_node: 2,
-            to_node: 0,
+            from_node: AiGraphNodeId::new(2),
+            to_node: AiGraphNodeId::new(0),
         });
 
         match resolve_parsed_graph(2, &parsed) {
