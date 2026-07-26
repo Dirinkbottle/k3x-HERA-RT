@@ -27,6 +27,15 @@ pub enum AiRuntimeErr {
     InvalidShape,
     /// 张量 layout 非法。
     InvalidLayout,
+    /// graph 执行失败，携带失败节点详情。
+    GraphExecutionFailed {
+        /// 第一个失败节点的 id。
+        node_id: u32,
+        /// 失败算子的 op 码。
+        op: u8,
+        /// BackendErr as u8。
+        backend_err: u8,
+    },
 }
 
 impl fmt::Display for AiRuntimeErr {
@@ -43,23 +52,33 @@ impl fmt::Display for AiRuntimeErr {
             Self::AllocFailed => write!(f, "allocation failed"),
             Self::InvalidShape => write!(f, "invalid tensor shape"),
             Self::InvalidLayout => write!(f, "invalid tensor layout"),
+            Self::GraphExecutionFailed {
+                node_id,
+                op,
+                backend_err,
+            } => write!(
+                f,
+                "graph execution failed at node {} (op={}): backend error {}",
+                node_id, op, backend_err
+            ),
         }
     }
 }
 
 /// 调度器错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SchedulerErr {
     /// graph 结构非法。
-    InvalidGraph,
+    InvalidGraph = 1,
     /// graph 解析失败。
-    ParseFailed,
+    ParseFailed = 2,
     /// graph 节点映射到 backend 失败。
-    NodeMappingFailed,
+    NodeMappingFailed = 3,
     /// 算子执行失败。
-    ExecutionFailed,
+    ExecutionFailed = 4,
     /// 完成通知发送失败。
-    NotificationFailed,
+    NotificationFailed = 5,
 }
 
 impl fmt::Display for SchedulerErr {
@@ -76,27 +95,28 @@ impl fmt::Display for SchedulerErr {
 
 /// 内核态 Runtime 错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum KnAiRuntimeErr {
     /// 输入参数非法。
-    InvalidInput,
+    InvalidInput = 1,
     /// ABI 版本不匹配。
-    InvalidAbiVersion,
+    InvalidAbiVersion = 2,
     /// 用户态地址非法或不可访问。
-    BadAddress,
+    BadAddress = 3,
     /// 内核内存不足。
-    NoMemory,
+    NoMemory = 4,
     /// 资源已存在。
-    AlreadyExists,
+    AlreadyExists = 5,
     /// 操作会阻塞（非阻塞路径返回）。
-    WouldBlock,
+    WouldBlock = 6,
     /// 该操作暂不支持。
-    NotSupported,
+    NotSupported = 7,
     /// 共享内存无效或未注册。
-    InvalidSharedMemory,
+    InvalidSharedMemory = 8,
     /// channel 内无待处理消息。
-    ChannelEmpty,
+    ChannelEmpty = 9,
     /// 内存映射失败。
-    MapFailed,
+    MapFailed = 10,
 }
 
 impl fmt::Display for KnAiRuntimeErr {
@@ -117,22 +137,25 @@ impl fmt::Display for KnAiRuntimeErr {
 }
 
 /// Backend 算子执行错误
+///
+/// 0 保留表示"无错误"；码值稳定，可直接写入 `AiGraphState.error_flag`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum BackendErr {
     /// 输入参数非法。
-    InvalidInput,
+    InvalidInput = 1,
     /// tensor 描述非法。
-    InvalidTensor,
+    InvalidTensor = 2,
     /// 算子参数非法。
-    InvalidAttr,
+    InvalidAttr = 3,
     /// 数据类型不支持。
-    UnsupportedDtype,
+    UnsupportedDtype = 4,
     /// 算子不支持。
-    UnsupportedOp,
+    UnsupportedOp = 5,
     /// 算子执行失败。
-    ExecutionFailed,
+    ExecutionFailed = 6,
     /// 遇到空指针。
-    NullPointer,
+    NullPointer = 7,
 }
 
 impl fmt::Display for BackendErr {
@@ -148,3 +171,40 @@ impl fmt::Display for BackendErr {
         }
     }
 }
+
+impl BackendErr {
+    /// 从 `u8` 码值还原 `BackendErr`，无匹配时返回 `None`。
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::InvalidInput),
+            2 => Some(Self::InvalidTensor),
+            3 => Some(Self::InvalidAttr),
+            4 => Some(Self::UnsupportedDtype),
+            5 => Some(Self::UnsupportedOp),
+            6 => Some(Self::ExecutionFailed),
+            7 => Some(Self::NullPointer),
+            _ => None,
+        }
+    }
+}
+
+/// graph 执行完成后的回执，通过 completion channel 的 `Message::data` 发送。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AiCompletion {
+    /// 匹配提交的 user token。
+    pub user_token: u32,
+    /// 第一个失败节点的 node_id，所有节点成功时为 u32::MAX。
+    pub failed_node_id: u32,
+    /// 整体状态：0=成功，非0=`SchedulerErr as u8`。
+    pub status: u8,
+    /// 第一个失败节点的 `BackendErr as u8`，无失败时为 0。
+    pub failed_node_err: u8,
+    /// 第一个失败节点的算子 op 码。
+    pub failed_node_op: u8,
+    /// 对齐填充。
+    pub reserved: [u8; 5],
+}
+
+const _: () = assert!(core::mem::size_of::<AiCompletion>() == 16);
+const _: () = assert!(core::mem::align_of::<AiCompletion>() == 4);

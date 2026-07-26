@@ -11,7 +11,8 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
-use k3_ai_uabi::{UserToken, error::SchedulerErr};
+use k3_ai_uabi::{ UserToken, error::SchedulerErr};
+use k3_ai_uabi::AiCompletion;
 use k3_kernel_backend::k3_run_kernel;
 use log::{error, warn};
 use ov_channels::{Message, Sender};
@@ -549,7 +550,7 @@ pub fn worker(arg: usize) {
         // ── GDB 探针 A：主循环心跳，每轮都可通过 DEBUG_TRAP 激活 ──
         debug_trap_once();
 
-        if let Some(unit) = scheduler.take_task_for_core(expected_core_id) {
+        if let Some(mut unit) = scheduler.take_task_for_core(expected_core_id) {
             // ── GDB 探针 B：取到任务，进入执行分枝 ──
             debug_trap_once();
             warn!(
@@ -562,48 +563,71 @@ pub fn worker(arg: usize) {
             slot.worker_token
                 .store(unit.user_token.get(), Ordering::Release);
 
-            let mut success = true;
-            for node in unit.tasklink.iter() {
-                warn!(
-                    "worker run node begin: token={}, node_id={}, op={:?}",
-                    unit.user_token, node.node_id, node.desc.op
+        let mut success = true;
+        let mut first_failed_node_id: u32 = u32::MAX;
+        let mut first_failed_node_err: u8 = 0;
+        let mut first_failed_node_op: u8 = 0;
+        for node in unit.tasklink.iter_mut() {
+            warn!(
+                "worker run node begin: token={}, node_id={}, op={:?}",
+                unit.user_token, node.node_id, node.desc.op
+            );
+            // ── GDB 探针 C：即将执行 k3_run_kernel ──
+            debug_trap_once();
+            let ret = unsafe { k3_run_kernel(node) };
+            // ── GDB 探针 D：k3_run_kernel 已返回 ──
+            debug_trap_once();
+            warn!(
+                "worker run node end: token={}, node_id={}, op={:?}, ret={}",
+                unit.user_token, node.node_id, node.desc.op, ret
+            );
+            if ret != 0 {
+                error!(
+                    "k3_run_kernel failed: node_id={}, op={:?}, ret={}, error_flag={}",
+                    node.node_id, node.desc.op, ret, node.state.error_flag
                 );
-                // ── GDB 探针 C：即将执行 k3_run_kernel ──
-                debug_trap_once();
-                let ret = unsafe { k3_run_kernel(node) };
-                // ── GDB 探针 D：k3_run_kernel 已返回 ──
-                debug_trap_once();
-                warn!(
-                    "worker run node end: token={}, node_id={}, op={:?}, ret={}",
-                    unit.user_token, node.node_id, node.desc.op, ret
-                );
-                if ret != 0 {
-                    error!(
-                        "k3_run_kernel failed: node_id={}, op={:?}, ret={}",
-                        node.node_id, node.desc.op, ret
-                    );
-                    success = false;
-                    break;
+                if first_failed_node_id == u32::MAX {
+                    first_failed_node_id = node.node_id.get();
+                    first_failed_node_err = node.state.error_flag;
+                    first_failed_node_op = node.desc.op.0;
                 }
+                success = false;
+                break;
             }
+        }
 
             warn!(
                 "worker all nodes done: token={}, success={}",
                 unit.user_token, success
             );
 
-            if success {
-                warn!("worker completion send begin: token={}", unit.user_token);
-                if unit
-                    .complete_sender
-                    .try_send(&Message::notification(unit.user_token.get()))
-                    .is_ok()
-                {
-                    warn!("worker completion send ok: token={}", unit.user_token);
-                } else {
-                    error!("Can't notificate caller! token={}", unit.user_token);
-                }
-            }
+        warn!(
+            "worker completion send begin: token={}, success={}",
+            unit.user_token, success
+        );
+        let completion = AiCompletion {
+            user_token: unit.user_token.get(),
+            failed_node_id: first_failed_node_id,
+            status: if success { 0 } else { SchedulerErr::ExecutionFailed as u8 },
+            failed_node_err: first_failed_node_err,
+            failed_node_op: first_failed_node_op,
+            reserved: [0; 5],
+        };
+        let completion_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &completion as *const AiCompletion as *const u8,
+                core::mem::size_of::<AiCompletion>(),
+            )
+        };
+        if unit.complete_sender.try_send(&Message::data(completion_bytes)).is_ok()
+        {
+            warn!(
+                "worker completion send ok: token={}, success={}",
+                unit.user_token, success
+            );
+        } else {
+            error!("Can't notificate caller! token={}", unit.user_token);
+        }
 
             slot.worker_token.store(0, Ordering::Release);
             slot.worker_busy.store(false, Ordering::Release);

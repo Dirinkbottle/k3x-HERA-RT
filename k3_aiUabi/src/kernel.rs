@@ -56,10 +56,18 @@ impl KernelOp {
     pub const REDUCE_MAX: Self = Self(23);
     /// 逐元素取模。
     pub const MOD: Self = Self(24);
+    /// ggml GetRows / embedding lookup。
+    pub const GET_ROWS: Self = Self(25);
+    /// ggml SetRows / KV cache row write。
+    pub const SET_ROWS: Self = Self(26);
+    /// Gated Linear Unit；v1 支持 SWIGLU split。
+    pub const GLU: Self = Self(27);
+    /// 通用 tensor copy / materialize contiguous。
+    pub const COPY: Self = Self(28);
 
     /// 最小合法性检查：op 编号是否落在已知算子区间内。
     pub const fn is_known(self) -> bool {
-        matches!(self.0, 1..=24)
+        matches!(self.0, 1..=28)
     }
 }
 

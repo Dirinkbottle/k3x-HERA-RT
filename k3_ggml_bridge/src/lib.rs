@@ -26,8 +26,8 @@ use k3_ai_runtime::fronted::{
 
 /// ggml-side success return code.
 const K3_GGML_OK: i32 = 1;
-/// ggml-side fallback/failure return code.
-const K3_GGML_FALLBACK: i32 = 0;
+/// ggml-side failure return code.
+const K3_GGML_FAILED: i32 = 0;
 
 /// MatMul flag indicating that the RHS logical matrix is stored transposed.
 const MATMUL_RHS_TRANSPOSED: u32 = 1 << 1;
@@ -36,6 +36,39 @@ const MATMUL_RHS_TRANSPOSED: u32 = 1 << 1;
 static CHANNEL: Mutex<Option<UringChannel>> = Mutex::new(None);
 /// Monotonic token source for bridge-submitted single-kernel graphs.
 static NEXT_TOKEN: AtomicU32 = AtomicU32::new(0x4B33_0000);
+
+/// Whole-graph compute request consumed by the native ggml K3 backend.
+#[repr(C)]
+pub struct K3GgmlGraphCompute {
+    /// Pointer to an array of K3 kernel descriptors.
+    pub nodes: *const AiKernelDesc,
+    /// Number of descriptors in `nodes`.
+    pub node_count: u32,
+    /// Non-zero means the caller requires strict no-fallback behavior.
+    pub strict: u32,
+}
+
+/// # Safety
+///
+/// `req` must point to a valid `K3GgmlGraphCompute`. When `node_count` is
+/// non-zero, `nodes` must point to at least that many valid `AiKernelDesc`
+/// entries whose referenced tensor buffers remain alive until the call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn k3_ggml_graph_compute(req: *const K3GgmlGraphCompute) -> i32 {
+    if req.is_null() {
+        eprintln!("k3_ggml_graph_compute: null request");
+        return K3_GGML_FAILED;
+    }
+    // SAFETY: null was checked above; the caller owns request validity.
+    let req = unsafe { &*req };
+    match run_graph(req) {
+        Ok(()) => K3_GGML_OK,
+        Err(err) => {
+            eprintln!("k3_ggml_graph_compute failed: {err}");
+            K3_GGML_FAILED
+        }
+    }
+}
 
 /// Flat F32 matmul request consumed by the C ABI entry point.
 #[repr(C)]
@@ -77,7 +110,7 @@ pub struct K3GgmlMatmulF32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn k3_ggml_matmul_f32(req: *const K3GgmlMatmulF32) -> i32 {
     if req.is_null() {
-        return K3_GGML_FALLBACK;
+        return K3_GGML_FAILED;
     }
 
     // SAFETY: null was checked above; the C caller is responsible for passing a
@@ -85,8 +118,41 @@ pub unsafe extern "C" fn k3_ggml_matmul_f32(req: *const K3GgmlMatmulF32) -> i32 
     let req = unsafe { &*req };
     match run_matmul_f32(req) {
         Ok(()) => K3_GGML_OK,
-        Err(_) => K3_GGML_FALLBACK,
+        Err(_) => K3_GGML_FAILED,
     }
+}
+
+/// Validate, serialize, submit, and wait for a whole K3 graph.
+fn run_graph(req: &K3GgmlGraphCompute) -> Result<(), &'static str> {
+    if req.node_count == 0 {
+        return Ok(());
+    }
+    if req.nodes.is_null() {
+        return Err("nodes is null with non-zero node_count");
+    }
+
+    let node_count = req.node_count as usize;
+    // SAFETY: request validation above and C ABI contract guarantee this span.
+    let nodes = unsafe { slice::from_raw_parts(req.nodes, node_count) };
+    let mut graph = GraphManager::new();
+    let mut tail = None;
+    for (index, node) in nodes.iter().copied().enumerate() {
+        tail = Some(if let Some(depend) = tail {
+            graph
+                .push_kernel_depend(depend, node)
+                .map_err(|_| "failed to append dependent graph node")?
+        } else {
+            graph
+                .push_kernel_no_depend(node)
+                .map_err(|_| "failed to append graph node")?
+        });
+        if node.op.0 == 0 {
+            eprintln!("k3_ggml_graph_compute: node {index} has invalid op 0");
+            return Err("invalid op");
+        }
+    }
+
+    submit_frozen_graph(graph).map_err(|_| "graph submission failed")
 }
 
 /// Validate, stage, submit, and copy back one F32 matmul request.
@@ -214,17 +280,23 @@ fn submit_single_matmul(
         ))
         .map_err(|_| ())?;
 
+    submit_frozen_graph(graph)
+}
+
+/// Freeze and submit a graph through the lazily-created runtime channel.
+fn submit_frozen_graph(graph: GraphManager) -> Result<(), ()> {
     let blob = graph.freeze().map_err(|_| ())?;
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     let entry = blob.submit_entry(UserToken::new(token));
-
     let mut channel = CHANNEL.lock().map_err(|_| ())?;
     if channel.is_none() {
         *channel = Some(build_channel().map_err(|_| ())?);
     }
     let channel = channel.as_ref().ok_or(())?;
     submit_graph(channel, &entry).map_err(|_| ())?;
-    wait_graph_complete(&entry, channel).map_err(|_| ())?;
+    wait_graph_complete(&entry, channel).map_err(|e| {
+        eprintln!("k3_ggml_graph_compute: wait_graph_complete failed: {e}");
+    })?;
     Ok(())
 }
 

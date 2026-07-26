@@ -56,12 +56,43 @@ impl BroadcastPlan {
         Ok(Self { lhs, rhs, output })
     }
 
+    /// 构造 GGML axis-0 权重广播计划。
+    fn new_ggml_axis0(
+        lhs: TensorMeta,
+        rhs: TensorMeta,
+        output: TensorMeta,
+    ) -> Result<Self, BackendErr> {
+        if lhs.rank == output.rank
+            && lhs.shape[..lhs.rank] == output.shape[..output.rank]
+            && rhs.rank == 1
+            && rhs.shape[0] == output.shape[0]
+        {
+            return Ok(Self { lhs, rhs, output });
+        }
+        if rhs.rank == output.rank
+            && rhs.shape[..rhs.rank] == output.shape[..output.rank]
+            && lhs.rank == 1
+            && lhs.shape[0] == output.shape[0]
+        {
+            return Ok(Self { lhs, rhs, output });
+        }
+        Err(BackendErr::InvalidTensor)
+    }
+
     /// 返回 output 逻辑下标对应的 lhs/rhs/output 底层元素下标。
     fn offsets(&self, linear: usize) -> Result<(usize, usize, usize), BackendErr> {
         let mut out_coordinates = [0_usize; MAX_DIM];
         self.output.coordinates(linear, &mut out_coordinates)?;
-        let lhs_coordinates = broadcast_coordinates(&self.lhs, &self.output, &out_coordinates);
-        let rhs_coordinates = broadcast_coordinates(&self.rhs, &self.output, &out_coordinates);
+        let lhs_coordinates = if self.lhs.rank == 1 && self.lhs.shape[0] == self.output.shape[0] {
+            axis0_coordinates(&out_coordinates)
+        } else {
+            broadcast_coordinates(&self.lhs, &self.output, &out_coordinates)
+        };
+        let rhs_coordinates = if self.rhs.rank == 1 && self.rhs.shape[0] == self.output.shape[0] {
+            axis0_coordinates(&out_coordinates)
+        } else {
+            broadcast_coordinates(&self.rhs, &self.output, &out_coordinates)
+        };
         Ok((
             self.lhs.offset_for_coordinates(&lhs_coordinates)?,
             self.rhs.offset_for_coordinates(&rhs_coordinates)?,
@@ -86,7 +117,11 @@ pub(crate) unsafe fn binary_caller(
     let lhs_meta = ctx.inputs[0].checked_meta()?;
     let rhs_meta = ctx.inputs[1].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
-    let plan = BroadcastPlan::new(lhs_meta, rhs_meta, output_meta)?;
+    let plan = if attr.broadcast_kind == BinaryAttr::BROADCAST_GGML_LAST_DIM {
+        BroadcastPlan::new_ggml_axis0(lhs_meta, rhs_meta, output_meta)?
+    } else {
+        BroadcastPlan::new(lhs_meta, rhs_meta, output_meta)?
+    };
 
     let lhs_dtype = ctx.inputs[0].dtype;
     if lhs_dtype != ctx.inputs[1].dtype || lhs_dtype != ctx.outputs[0].dtype {
@@ -148,6 +183,13 @@ fn broadcast_coordinates(
             output_coordinates[output_axis]
         };
     }
+    coordinates
+}
+
+/// GGML one-dimensional weight broadcast coordinates.
+fn axis0_coordinates(output_coordinates: &[usize; MAX_DIM]) -> [usize; MAX_DIM] {
+    let mut coordinates = [0_usize; MAX_DIM];
+    coordinates[0] = output_coordinates[0];
     coordinates
 }
 

@@ -7,7 +7,7 @@ use super::kd_uring::MmapMemory;
 use k3_ai_uabi::error::AiRuntimeErr;
 use k3_ai_uabi::{
     AiDtype, AiTensorDesc, AiTensorFormat, AiTensorLayout, ByteSize, DimSize, MAX_DIM, TensorFlags,
-    UserVa, tensor_size_bytes,
+    UserVa, ggml_quant_tensor_size_bytes, tensor_size_bytes,
 };
 
 /// 用户态 tensor 句柄。
@@ -139,6 +139,37 @@ impl TensorManager {
             dtype,
             format,
             layout,
+            &shape_dims,
+            TensorFlags::new(flags),
+        );
+
+        Ok(Tensor { desc, storage })
+    }
+
+    /// 分配一个 ggml 量化 layout tensor。
+    pub fn alloc_ggml_quant_tensor(
+        &self,
+        dtype: AiDtype,
+        shape: &[u32],
+        flags: u8,
+    ) -> Result<Tensor, AiRuntimeErr> {
+        if shape.len() > MAX_DIM {
+            return Err(AiRuntimeErr::InvalidShape);
+        }
+        let shape_dims: Vec<DimSize> = shape.iter().copied().map(DimSize::new).collect();
+        let size_bytes =
+            ggml_quant_tensor_size_bytes(dtype, &shape_dims).ok_or(AiRuntimeErr::InvalidShape)?;
+        let alloc_size = size_bytes
+            .try_as_usize()
+            .map_err(|_| AiRuntimeErr::InvalidShape)?;
+
+        let mut storage =
+            MmapMemory::new_shared(alloc_size).map_err(|_| AiRuntimeErr::AllocFailed)?;
+        let desc = AiTensorDesc::from_user_quant_buffer(
+            UserVa::new(storage.as_mut_ptr() as u64),
+            ByteSize::new(storage.len() as u64),
+            dtype,
+            AiTensorFormat::ANY,
             &shape_dims,
             TensorFlags::new(flags),
         );

@@ -2,14 +2,15 @@
 
 use crate::BackendCall;
 use crate::call::{CallContext, TensorMeta, normalize_axis};
+use crate::quant;
 use crate::rvv::{self, BinaryOp};
 use alloc::vec;
 use alloc::vec::Vec;
 use half::f16;
 use k3_ai_uabi::error::BackendErr;
 use k3_ai_uabi::{
-    AiDtype, AiTargetHint, CastAttr, ConcatAttr, ExpandAttr, GatherAttr, GatherElementsAttr,
-    MAX_DIM, Resize2dAttr, TileAttr, TransposeAttr,
+    AiDtype, AiTargetHint, CastAttr, ConcatAttr, CopyAttr, ExpandAttr, GatherAttr,
+    GatherElementsAttr, GetRowsAttr, MAX_DIM, Resize2dAttr, SetRowsAttr, TileAttr, TransposeAttr,
 };
 
 /// Concat 调用入口。
@@ -248,6 +249,248 @@ pub(crate) unsafe fn gather_elements_caller(call: *const BackendCall) -> Result<
     )?;
     let output = unsafe { ctx.outputs[0].as_mut_slice::<u8>()? };
     write_logical_bytes(&logical_output, output, &output_meta, ctx.target)
+}
+
+/// GGML GetRows 调用入口。
+///
+/// # Safety
+///
+/// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
+pub(crate) unsafe fn get_rows_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+    let ctx = unsafe { CallContext::from_call(call)? };
+    ctx.expect_io(2, 1)?;
+    ctx.reject_input_output_alias()?;
+    let attr = ctx.read_attr::<GetRowsAttr>()?;
+    if attr.flags.get() != 0 {
+        return Err(BackendErr::InvalidAttr);
+    }
+
+    let indices_meta = ctx.inputs[1].checked_meta()?;
+    let output_meta = ctx.outputs[0].checked_meta()?;
+    let indices = read_indices(&ctx.inputs[1], &indices_meta)?;
+    if output_meta.rank != 4 || indices_meta.rank > 4 {
+        return Err(BackendErr::InvalidTensor);
+    }
+
+    let data_dtype = ctx.inputs[0].dtype;
+    if !matches!(ctx.outputs[0].dtype, AiDtype::F32 | AiDtype::F16) {
+        return Err(BackendErr::UnsupportedDtype);
+    }
+
+    let mut output = vec![0.0_f32; output_meta.element_count];
+    if data_dtype.is_ggml_quant() {
+        let data_meta = ctx.inputs[0].checked_quant_meta()?;
+        validate_get_rows_shapes(
+            data_meta.rank,
+            &data_meta.shape,
+            &indices_meta,
+            &output_meta,
+        )?;
+        for linear in 0..output_meta.element_count {
+            let mut out_coordinates = [0_usize; MAX_DIM];
+            output_meta.coordinates(linear, &mut out_coordinates)?;
+            let row_index = get_rows_index(&indices, &indices_meta, &out_coordinates)?;
+            let mut data_coordinates = [0_usize; MAX_DIM];
+            data_coordinates[0] = out_coordinates[0];
+            data_coordinates[1] = row_index;
+            data_coordinates[2..4].copy_from_slice(&out_coordinates[2..4]);
+            output[linear] = quant::read_quant_f32(&ctx.inputs[0], &data_meta, &data_coordinates)?;
+        }
+    } else {
+        let data_meta = ctx.inputs[0].checked_meta()?;
+        validate_get_rows_shapes(
+            data_meta.rank,
+            &data_meta.shape,
+            &indices_meta,
+            &output_meta,
+        )?;
+        for linear in 0..output_meta.element_count {
+            let mut out_coordinates = [0_usize; MAX_DIM];
+            output_meta.coordinates(linear, &mut out_coordinates)?;
+            let row_index = get_rows_index(&indices, &indices_meta, &out_coordinates)?;
+            let mut data_coordinates = [0_usize; MAX_DIM];
+            data_coordinates[0] = out_coordinates[0];
+            data_coordinates[1] = row_index;
+            data_coordinates[2..4].copy_from_slice(&out_coordinates[2..4]);
+            output[linear] = read_dense_f32(&ctx.inputs[0], &data_meta, &data_coordinates)?;
+        }
+    }
+    write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
+}
+
+/// GGML SetRows 调用入口。
+///
+/// # Safety
+///
+/// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
+pub(crate) unsafe fn set_rows_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+    let ctx = unsafe { CallContext::from_call(call)? };
+    ctx.expect_io(3, 1)?;
+    let attr = ctx.read_attr::<SetRowsAttr>()?;
+    if attr.flags.get() != 0 {
+        return Err(BackendErr::InvalidAttr);
+    }
+
+    let source_meta = ctx.inputs[0].checked_meta()?;
+    let indices_meta = ctx.inputs[1].checked_meta()?;
+    let dest_meta = ctx.inputs[2].checked_meta()?;
+    let output_meta = ctx.outputs[0].checked_meta()?;
+    if ctx.inputs[0].dtype != AiDtype::F32
+        || !matches!(ctx.outputs[0].dtype, AiDtype::F32 | AiDtype::F16)
+        || ctx.inputs[2].dtype != ctx.outputs[0].dtype
+        || source_meta.rank != 4
+        || dest_meta.rank != 4
+        || output_meta.rank != 4
+        || dest_meta.shape[..4] != output_meta.shape[..4]
+        || source_meta.shape[0] != dest_meta.shape[0]
+        || source_meta.shape[2] != dest_meta.shape[2]
+        || source_meta.shape[3] != dest_meta.shape[3]
+    {
+        return Err(BackendErr::InvalidTensor);
+    }
+
+    let indices = read_indices(&ctx.inputs[1], &indices_meta)?;
+    let mut output = read_float_tensor(&ctx.inputs[2], &dest_meta, ctx.target)?;
+    let nc = source_meta.shape[0];
+    let nr = source_meta.shape[1];
+    for i3 in 0..source_meta.shape[3] {
+        for i2 in 0..source_meta.shape[2] {
+            for i in 0..nr {
+                let row_index = set_rows_index(&indices, &indices_meta, i, i2, i3)?;
+                if row_index >= dest_meta.shape[1] {
+                    return Err(BackendErr::InvalidInput);
+                }
+                for col in 0..nc {
+                    let mut source_coordinates = [0_usize; MAX_DIM];
+                    source_coordinates[0] = col;
+                    source_coordinates[1] = i;
+                    source_coordinates[2] = i2;
+                    source_coordinates[3] = i3;
+                    let value = read_dense_f32(&ctx.inputs[0], &source_meta, &source_coordinates)?;
+                    let mut output_coordinates = [0_usize; MAX_DIM];
+                    output_coordinates[0] = col;
+                    output_coordinates[1] = row_index;
+                    output_coordinates[2] = i2;
+                    output_coordinates[3] = i3;
+                    let output_linear = row_major_linear(&output_meta, &output_coordinates)?;
+                    output[output_linear] = value;
+                }
+            }
+        }
+    }
+    write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
+}
+
+/// Materialize/copy one tensor into another.
+///
+/// # Safety
+///
+/// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
+pub(crate) unsafe fn copy_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+    let ctx = unsafe { CallContext::from_call(call)? };
+    ctx.expect_io(1, 1)?;
+    let attr = ctx.read_attr::<CopyAttr>()?;
+    if attr.flags.get() != 0 {
+        return Err(BackendErr::InvalidAttr);
+    }
+    let input_meta = ctx.inputs[0].checked_meta()?;
+    let output_meta = ctx.outputs[0].checked_meta()?;
+    if ctx.inputs[0].dtype != ctx.outputs[0].dtype
+        || input_meta.element_count != output_meta.element_count
+    {
+        return Err(BackendErr::InvalidTensor);
+    }
+    if ctx.inputs[0].data == ctx.outputs[0].data {
+        return Ok(());
+    }
+    let input = unsafe { ctx.inputs[0].as_slice::<u8>()? };
+    let logical = read_logical_bytes(input, &input_meta, ctx.target)?;
+    let output = unsafe { ctx.outputs[0].as_mut_slice::<u8>()? };
+    write_logical_bytes(&logical, output, &output_meta, ctx.target)
+}
+
+/// Validate ggml get_rows shape relation.
+fn validate_get_rows_shapes(
+    data_rank: usize,
+    data_shape: &[usize; MAX_DIM],
+    indices_meta: &TensorMeta,
+    output_meta: &TensorMeta,
+) -> Result<(), BackendErr> {
+    let data_dim = |axis| dim_or_one(data_shape, data_rank, axis);
+    let index_dim = |axis| dim_or_one(&indices_meta.shape, indices_meta.rank, axis);
+    if data_rank > 4
+        || indices_meta.rank > 4
+        || output_meta.rank != 4
+        || output_meta.shape[0] != data_dim(0)
+        || output_meta.shape[1] != index_dim(0)
+        || output_meta.shape[2] != index_dim(1)
+        || output_meta.shape[3] != index_dim(2)
+        || data_dim(2) != index_dim(1)
+        || data_dim(3) != index_dim(2)
+    {
+        return Err(BackendErr::InvalidTensor);
+    }
+    Ok(())
+}
+
+/// Return a shape dimension, treating missing ggml high dimensions as 1.
+fn dim_or_one(shape: &[usize; MAX_DIM], rank: usize, axis: usize) -> usize {
+    if axis < rank { shape[axis] } else { 1 }
+}
+
+/// Resolve get_rows row index for an output coordinate.
+fn get_rows_index(
+    indices: &[i64],
+    indices_meta: &TensorMeta,
+    output_coordinates: &[usize; MAX_DIM],
+) -> Result<usize, BackendErr> {
+    let mut index_coordinates = [0_usize; MAX_DIM];
+    index_coordinates[0] = output_coordinates[1];
+    index_coordinates[1] = output_coordinates[2];
+    index_coordinates[2] = output_coordinates[3];
+    let linear = row_major_linear(indices_meta, &index_coordinates)?;
+    usize::try_from(indices[linear]).map_err(|_| BackendErr::InvalidInput)
+}
+
+/// Resolve set_rows destination row index for source row and batch coordinates.
+fn set_rows_index(
+    indices: &[i64],
+    indices_meta: &TensorMeta,
+    row: usize,
+    i2: usize,
+    i3: usize,
+) -> Result<usize, BackendErr> {
+    if row >= dim_or_one(&indices_meta.shape, indices_meta.rank, 0) {
+        return Err(BackendErr::InvalidTensor);
+    }
+    let idx1 = i2 % dim_or_one(&indices_meta.shape, indices_meta.rank, 1);
+    let idx2 = i3 % dim_or_one(&indices_meta.shape, indices_meta.rank, 2);
+    let mut coordinates = [0_usize; MAX_DIM];
+    coordinates[0] = row;
+    coordinates[1] = idx1;
+    coordinates[2] = idx2;
+    let linear = row_major_linear(indices_meta, &coordinates)?;
+    usize::try_from(indices[linear]).map_err(|_| BackendErr::InvalidInput)
+}
+
+/// Read one dense F32/F16 tensor scalar as f32.
+fn read_dense_f32(
+    view: &crate::BackendTensorView,
+    meta: &TensorMeta,
+    coordinates: &[usize; MAX_DIM],
+) -> Result<f32, BackendErr> {
+    let offset = meta.offset_for_coordinates(coordinates)?;
+    match view.dtype {
+        AiDtype::F32 => {
+            let values = unsafe { view.as_slice::<f32>()? };
+            Ok(values[offset])
+        }
+        AiDtype::F16 => {
+            let values = unsafe { view.as_slice::<u16>()? };
+            Ok(f16::from_bits(values[offset]).to_f32())
+        }
+        _ => Err(BackendErr::UnsupportedDtype),
+    }
 }
 
 /// Expand 调用入口。

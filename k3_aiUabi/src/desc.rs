@@ -48,6 +48,10 @@ impl AiDtype {
     pub const Q4_K: Self = Self(101);
     /// ggml Q8_0 量化格式。
     pub const Q8_0: Self = Self(102);
+    /// ggml Q3_K 量化格式。
+    pub const Q3_K: Self = Self(103);
+    /// ggml IQ4_NL 量化格式。
+    pub const IQ4_NL: Self = Self(104);
 
     /// 固定宽度 dtype 的单元素字节数。
     ///
@@ -61,6 +65,31 @@ impl AiDtype {
             6 => Some(8),
             _ => None,
         }
+    }
+
+    /// 返回 ggml 量化 dtype 的 block 内逻辑元素数。
+    pub const fn ggml_quant_block_size(self) -> Option<u32> {
+        match self.0 {
+            102 => Some(32),
+            103 => Some(256),
+            104 => Some(32),
+            _ => None,
+        }
+    }
+
+    /// 返回 ggml 量化 dtype 单个 block 的物理字节数。
+    pub const fn ggml_quant_block_bytes(self) -> Option<u32> {
+        match self.0 {
+            102 => Some(34),
+            103 => Some(110),
+            104 => Some(18),
+            _ => None,
+        }
+    }
+
+    /// 判断 dtype 是否为本 ABI 可描述的 ggml 量化块格式。
+    pub const fn is_ggml_quant(self) -> bool {
+        self.ggml_quant_block_size().is_some()
     }
 }
 
@@ -178,9 +207,13 @@ impl AiTensorDesc {
     ) -> Self {
         assert!(shape.len() <= MAX_DIM);
 
+        assert!(
+            layout != AiTensorLayout::GGML_QUANT,
+            "ggml quant tensor needs from_user_quant_buffer"
+        );
         let element_size = dtype
             .element_size_bytes()
-            .expect("quantized or unknown dtype needs explicit size path");
+            .expect("unknown dtype needs explicit size path");
         let required_size = tensor_size_bytes(shape, element_size);
         assert!(size_bytes.get() >= required_size.get());
 
@@ -207,6 +240,64 @@ impl AiTensorDesc {
         }
         desc
     }
+
+    /// 从一块已有的 ggml 量化 buffer 构造 tensor 描述。
+    ///
+    /// shape 使用逻辑元素数；第 0 维必须是量化 block 的整数倍。stride 采用
+    /// ggml 约定：第 0 维 stride 为 block 字节数，其余维度按完整逻辑行递增。
+    pub fn from_user_quant_buffer(
+        user_va: UserVa,
+        size_bytes: ByteSize,
+        dtype: AiDtype,
+        format: AiTensorFormat,
+        shape: &[DimSize],
+        flags: TensorFlags,
+    ) -> Self {
+        assert!(shape.len() <= MAX_DIM);
+        let required_size = ggml_quant_tensor_size_bytes(dtype, shape)
+            .expect("invalid ggml quant tensor shape or dtype");
+        assert!(size_bytes.get() >= required_size.get());
+
+        let block_size = dtype
+            .ggml_quant_block_size()
+            .expect("invalid ggml quant dtype");
+        let block_bytes = dtype
+            .ggml_quant_block_bytes()
+            .expect("invalid ggml quant dtype");
+
+        let mut desc = Self {
+            user_va,
+            size_bytes,
+            dtype,
+            format,
+            layout: AiTensorLayout::GGML_QUANT,
+            ndim: DimCount::new(shape.len() as u32),
+            flags,
+            quant: AiQuantDesc {
+                block_size: DimSize::new(block_size),
+                scale_dtype: AiDtype::F16,
+                flags,
+                ..AiQuantDesc::default()
+            },
+            ..Self::default()
+        };
+
+        desc.shape[..shape.len()].copy_from_slice(shape);
+        if !shape.is_empty() {
+            desc.stride_bytes[0] = ByteStride::new(block_bytes as u64);
+            let row_blocks = shape[0].get() as u64 / block_size as u64;
+            let mut stride = row_blocks
+                .checked_mul(block_bytes as u64)
+                .expect("quant tensor stride overflow");
+            for dim_idx in 1..shape.len() {
+                desc.stride_bytes[dim_idx] = ByteStride::new(stride);
+                stride = stride
+                    .checked_mul(shape[dim_idx].get() as u64)
+                    .expect("quant tensor stride overflow");
+            }
+        }
+        desc
+    }
 }
 
 /// 计算 tensor 数据总字节数：各维度元素数之积 × 单元素字节数。
@@ -220,6 +311,24 @@ pub fn tensor_size_bytes(shape: &[DimSize], element_size: u32) -> ByteSize {
             .checked_mul(element_size as u64)
             .expect("tensor byte size overflow"),
     )
+}
+
+/// 计算 ggml 量化 tensor 数据总字节数。
+pub fn ggml_quant_tensor_size_bytes(dtype: AiDtype, shape: &[DimSize]) -> Option<ByteSize> {
+    if shape.is_empty() {
+        return None;
+    }
+    let block_size = dtype.ggml_quant_block_size()? as u64;
+    let block_bytes = dtype.ggml_quant_block_bytes()? as u64;
+    let first = shape[0].get() as u64;
+    if first == 0 || !first.is_multiple_of(block_size) {
+        return None;
+    }
+    let row_bytes = first.checked_div(block_size)?.checked_mul(block_bytes)?;
+    let rows = shape[1..]
+        .iter()
+        .try_fold(1_u64, |acc, dim| acc.checked_mul(dim.get() as u64))?;
+    row_bytes.checked_mul(rows).map(ByteSize::new)
 }
 
 /// 单个 lowered 算子的稳定描述。

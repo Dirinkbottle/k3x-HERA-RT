@@ -141,6 +141,11 @@ impl TaskLink {
         self.ordered_nodes.iter()
     }
 
+    /// 按调度顺序可变遍历直链中的节点。
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut AiGraphNode> {
+        self.ordered_nodes.iter_mut()
+    }
+
     /// 弹出并返回链首节点，链空时返回 `None`。
     pub fn pop_front(&mut self) -> Option<AiGraphNode> {
         if self.ordered_nodes.is_empty() {

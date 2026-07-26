@@ -18,6 +18,7 @@ pub mod call;
 pub mod conv2d;
 pub mod matmul;
 pub mod nn;
+pub mod quant;
 mod rvv;
 pub mod transform;
 pub mod unary;
@@ -27,17 +28,22 @@ pub use call::{BackendCall, BackendTensorView};
 /// 内核入口,tensor地址需要已经映射
 /// backend 算子分发入口，按 `call.op` 路由到对应算子执行器。
 ///
+/// 成功返回 0；失败返回负错误码并把 `BackendErr` 写入 `node.state.error_flag`，
+/// 同时标记 `node.state.complete = 1`。
+///
 /// # Safety
 ///
 /// `node.desc.tensors[*].kernel_va` 必须已经映射到 backend 当前地址空间可访问的
 /// 有效内存，且输入/输出 tensor 的生命周期覆盖本次调用。
-pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
+pub unsafe extern "C" fn k3_run_kernel(node: &mut AiGraphNode) -> i32 {
     let desc = &node.desc;
     let total_count = match desc.input_count.checked_total(desc.output_count) {
         Ok(total_count) => total_count,
         Err(err) => {
             error!("k3_run_kernel: invalid tensor count: {:?}", err);
-            return -1;
+            node.state.error_flag = BackendErr::InvalidInput as u8;
+            node.state.complete = 1;
+            return -(BackendErr::InvalidInput as i32);
         }
     };
     if total_count > MAX_SUBMIT_TENSORS {
@@ -45,7 +51,9 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
             "k3_run_kernel: tensor count {} exceeds max {}",
             total_count, MAX_SUBMIT_TENSORS
         );
-        return -1;
+        node.state.error_flag = BackendErr::InvalidInput as u8;
+        node.state.complete = 1;
+        return -(BackendErr::InvalidInput as i32);
     }
 
     let input_count = desc.input_count.get() as usize;
@@ -98,6 +106,7 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
         KernelOp::RMS_NORM => unsafe { nn::rms_norm_caller(&call) },
         KernelOp::ROPE => unsafe { nn::rope_caller(&call) },
         KernelOp::SOFTMAX => unsafe { nn::softmax_caller(&call) },
+        KernelOp::GLU => unsafe { nn::glu_caller(&call) },
         KernelOp::MAX_POOL => unsafe { nn::max_pool_caller(&call) },
         KernelOp::REDUCE_MAX => unsafe { nn::reduce_max_caller(&call) },
         KernelOp::TOP_K => unsafe { nn::top_k_caller(&call) },
@@ -105,6 +114,9 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
         KernelOp::TRANSPOSE => unsafe { transform::transpose_caller(&call) },
         KernelOp::GATHER => unsafe { transform::gather_caller(&call) },
         KernelOp::GATHER_ELEMENTS => unsafe { transform::gather_elements_caller(&call) },
+        KernelOp::GET_ROWS => unsafe { transform::get_rows_caller(&call) },
+        KernelOp::SET_ROWS => unsafe { transform::set_rows_caller(&call) },
+        KernelOp::COPY => unsafe { transform::copy_caller(&call) },
         KernelOp::CAST => unsafe { transform::cast_caller(&call) },
         KernelOp::RESIZE => unsafe { transform::resize_caller(&call) },
         KernelOp::EXPAND => unsafe { transform::expand_caller(&call) },
@@ -113,10 +125,15 @@ pub unsafe extern "C" fn k3_run_kernel(node: &AiGraphNode) -> i32 {
     };
 
     match result {
-        Ok(()) => 0,
+        Ok(()) => {
+            node.state.complete = 1;
+            0
+        }
         Err(e) => {
             error!("k3_run_kernel failed: {:?}", e);
-            -1
+            node.state.error_flag = e as u8;
+            node.state.complete = 1;
+            -(e as i32)
         }
     }
 }
@@ -135,6 +152,9 @@ mod tests {
         node.desc.input_count = TensorCount::new(MAX_SUBMIT_TENSORS as u32 + 1);
         node.desc.output_count = TensorCount::new(0);
 
-        assert_eq!(unsafe { k3_run_kernel(&node) }, -1);
+        assert_eq!(
+            unsafe { k3_run_kernel(&mut node) },
+            -(BackendErr::InvalidInput as i32)
+        );
     }
 }

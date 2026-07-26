@@ -180,7 +180,7 @@ pub(crate) unsafe fn conv2d_caller(call: *const BackendCall) -> Result<(), Backe
                 None
             };
             let output = unsafe { ctx.outputs[0].as_mut_slice::<i32>()? };
-            conv2d_int8(&geom, input, weight, bias, output, i_dt, w_dt)
+            conv2d_int8(&geom, input, weight, bias, output, i_dt, w_dt, target)
         }
         _ => {
             error!(
@@ -449,10 +449,7 @@ fn conv2d_f16_ime(
     Ok(())
 }
 
-/// int8 卷积：im2col 展开为 `[K, N]` col 矩阵，与权重 `[Cout, K]` 相乘复用 IME。
-///
-/// 复用 [`ime_int8_i32_matmul`]：lhs=weight(M=Cout, K=patch), rhs=col(K, N=spatial)，
-/// 行主序无转置，out=[Cout, spatial]。IME tile 逻辑在 x86 测试下走软件参考。
+/// int8 卷积：CPU target 走直接卷积，X100/A100 target 才复用 IME matmul。
 fn conv2d_int8(
     g: &Conv2dGeom,
     input: &[u8],
@@ -461,6 +458,7 @@ fn conv2d_int8(
     output: &mut [i32],
     in_dtype: AiDtype,
     w_dtype: AiDtype,
+    target: AiTargetHint,
 ) -> Result<(), BackendErr> {
     validate_lengths(
         g,
@@ -469,6 +467,76 @@ fn conv2d_int8(
         output.len(),
         bias.map(<[i32]>::len),
     )?;
+    match target {
+        AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => {
+            conv2d_int8_cpu(g, input, weight, bias, output, in_dtype, w_dtype)
+        }
+        AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => {
+            conv2d_int8_ime(g, input, weight, bias, output, in_dtype, w_dtype)
+        }
+        _ => unreachable!("CallContext rejects unknown targets"),
+    }
+}
+
+/// int8 直接卷积（cpu 软件参考实现）。
+fn conv2d_int8_cpu(
+    g: &Conv2dGeom,
+    input: &[u8],
+    weight: &[u8],
+    bias: Option<&[i32]>,
+    output: &mut [i32],
+    in_dtype: AiDtype,
+    w_dtype: AiDtype,
+) -> Result<(), BackendErr> {
+    let patch = g.patch_size();
+    let cin_group = g.cin_per_group();
+    let cout_group = g.cout_per_group();
+    for b in 0..g.batch {
+        for oc in 0..g.cout {
+            let group = oc / cout_group;
+            let input_channel_base = group * cin_group;
+            let w_base = oc * patch;
+            for oy in 0..g.oh {
+                for ox in 0..g.ow {
+                    let mut acc = bias.map_or(0_i32, |bias| bias[oc]);
+                    for ic in 0..cin_group {
+                        let input_channel = input_channel_base + ic;
+                        for ky in 0..g.kh {
+                            for kx in 0..g.kw {
+                                let w = int8_value(
+                                    weight[w_base + (ic * g.kh + ky) * g.kw + kx],
+                                    w_dtype,
+                                );
+                                if let Some(idx) = input_index(g, b, input_channel, oy, ox, ky, kx)
+                                {
+                                    acc = acc.wrapping_add(
+                                        w.wrapping_mul(int8_value(input[idx], in_dtype)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    output[((b * g.cout + oc) * g.oh + oy) * g.ow + ox] = acc;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// int8 IME 卷积：im2col 展开为 `[K, N]` col 矩阵，与权重 `[Cout, K]` 相乘。
+///
+/// 复用 [`ime_int8_i32_matmul`]：lhs=weight(M=Cout, K=patch), rhs=col(K, N=spatial)，
+/// 行主序无转置，out=[Cout, spatial]。
+fn conv2d_int8_ime(
+    g: &Conv2dGeom,
+    input: &[u8],
+    weight: &[u8],
+    bias: Option<&[i32]>,
+    output: &mut [i32],
+    in_dtype: AiDtype,
+    w_dtype: AiDtype,
+) -> Result<(), BackendErr> {
     let k = g.patch_size();
     let n = g.spatial();
     let m = g.cout_per_group();
@@ -523,6 +591,15 @@ fn conv2d_int8(
     }
     let _ = in_dtype;
     Ok(())
+}
+
+/// 按 dtype 解释一个 int8/uint8 物理字节。
+fn int8_value(value: u8, dtype: AiDtype) -> i32 {
+    if dtype == AiDtype::I8 {
+        (value as i8) as i32
+    } else {
+        value as i32
+    }
 }
 
 /// 构造 conv im2col 用的行主序、无转置、单 batch `MatMulAttr`。
@@ -675,6 +752,7 @@ mod tests {
             &mut out,
             AiDtype::I8,
             AiDtype::I8,
+            AiTargetHint::PREFER_X100,
         )
         .unwrap();
         assert_eq!(out, ref_int8(&g, &input, &weight, None));
@@ -698,6 +776,7 @@ mod tests {
             &mut out,
             AiDtype::I8,
             AiDtype::I8,
+            AiTargetHint::PREFER_X100,
         )
         .unwrap();
         assert_eq!(out, ref_int8(&g, &input, &weight, Some(&bias)));

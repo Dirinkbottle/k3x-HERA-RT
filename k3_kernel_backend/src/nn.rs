@@ -11,7 +11,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use k3_ai_uabi::error::BackendErr;
 use k3_ai_uabi::{
-    AiDtype, MAX_DIM, Pool2dAttr, ReduceMaxAttr, RmsNormAttr, RopeAttr, SoftmaxAttr, TopKAttr,
+    AiDtype, GluAttr, MAX_DIM, Pool2dAttr, ReduceMaxAttr, RmsNormAttr, RopeAttr, SoftmaxAttr,
+    TopKAttr,
 };
 
 /// Softmax 调用入口。
@@ -21,15 +22,35 @@ use k3_ai_uabi::{
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
 pub(crate) unsafe fn softmax_caller(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
-    ctx.expect_io(1, 1)?;
+    ctx.expect_io_range(1..=2, 1..=1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<SoftmaxAttr>()?;
+    if attr.max_bias != 0.0 {
+        return Err(BackendErr::InvalidAttr);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     validate_float_same_shape(&ctx, &input_meta, &output_meta)?;
     let axis = normalize_axis(attr.axis, input_meta.rank)?;
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
-    let output = softmax_f32(&input, &input_meta, axis, attr.scale, ctx.target)?;
+    let mask = if ctx.inputs.len() == 2 {
+        let meta = ctx.inputs[1].checked_meta()?;
+        if !matches!(ctx.inputs[1].dtype, AiDtype::F32 | AiDtype::F16) {
+            return Err(BackendErr::UnsupportedDtype);
+        }
+        validate_softmax_mask(&input_meta, &meta)?;
+        Some((read_float_tensor(&ctx.inputs[1], &meta, ctx.target)?, meta))
+    } else {
+        None
+    };
+    let output = softmax_f32(
+        &input,
+        &input_meta,
+        axis,
+        attr.scale,
+        mask.as_ref(),
+        ctx.target,
+    )?;
     write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
 }
 
@@ -40,25 +61,37 @@ pub(crate) unsafe fn softmax_caller(call: *const BackendCall) -> Result<(), Back
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
 pub(crate) unsafe fn rms_norm_caller(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
-    ctx.expect_io(2, 1)?;
+    ctx.expect_io_range(1..=2, 1..=1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<RmsNormAttr>()?;
     let input_meta = ctx.inputs[0].checked_meta()?;
-    let weight_meta = ctx.inputs[1].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     validate_float_same_shape(&ctx, &input_meta, &output_meta)?;
     let hidden = attr.hidden_size.get() as usize;
     if hidden == 0
         || input_meta.rank == 0
         || input_meta.shape[input_meta.rank - 1] != hidden
-        || weight_meta.element_count != hidden
-        || ctx.inputs[1].dtype != ctx.inputs[0].dtype
         || attr.eps <= 0.0
     {
         return Err(BackendErr::InvalidAttr);
     }
+    let weight_meta = if ctx.inputs.len() == 2 {
+        let meta = ctx.inputs[1].checked_meta()?;
+        if meta.element_count != hidden || ctx.inputs[1].dtype != ctx.inputs[0].dtype {
+            return Err(BackendErr::InvalidAttr);
+        }
+        Some(meta)
+    } else {
+        None
+    };
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
-    let weight = read_float_tensor(&ctx.inputs[1], &weight_meta, ctx.target)?;
+    let unit_weight;
+    let weight = if let Some(weight_meta) = weight_meta {
+        read_float_tensor(&ctx.inputs[1], &weight_meta, ctx.target)?
+    } else {
+        unit_weight = vec![1.0_f32; hidden];
+        unit_weight
+    };
     let output = rms_norm_f32(&input, &weight, hidden, attr.eps, ctx.target)?;
     write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
 }
@@ -115,6 +148,48 @@ pub(crate) unsafe fn rope_caller(call: *const BackendCall) -> Result<(), Backend
         positions.as_deref(),
         ctx.target,
     )?;
+    write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
+}
+
+/// GLU 调用入口，v1 支持 SWIGLU。
+///
+/// # Safety
+///
+/// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
+pub(crate) unsafe fn glu_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+    let ctx = unsafe { CallContext::from_call(call)? };
+    ctx.expect_io_range(1..=2, 1..=1)?;
+    ctx.reject_input_output_alias()?;
+    let attr = ctx.read_attr::<GluAttr>()?;
+    if attr.op != GluAttr::OP_SWIGLU || attr.flags.get() != 0 {
+        return Err(BackendErr::InvalidAttr);
+    }
+    let input_meta = ctx.inputs[0].checked_meta()?;
+    let output_meta = ctx.outputs[0].checked_meta()?;
+    if !matches!(ctx.inputs[0].dtype, AiDtype::F32 | AiDtype::F16)
+        || ctx.outputs[0].dtype != ctx.inputs[0].dtype
+        || input_meta.rank != output_meta.rank
+    {
+        return Err(BackendErr::InvalidTensor);
+    }
+    let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
+    let rhs = if ctx.inputs.len() == 2 {
+        let rhs_meta = ctx.inputs[1].checked_meta()?;
+        if ctx.inputs[1].dtype != ctx.inputs[0].dtype
+            || rhs_meta.rank != output_meta.rank
+            || rhs_meta.shape[..rhs_meta.rank] != output_meta.shape[..output_meta.rank]
+            || input_meta.shape[..input_meta.rank] != output_meta.shape[..output_meta.rank]
+        {
+            return Err(BackendErr::InvalidTensor);
+        }
+        read_float_tensor(&ctx.inputs[1], &rhs_meta, ctx.target)?
+    } else {
+        if input_meta.shape[0] != output_meta.shape[0] * 2 {
+            return Err(BackendErr::InvalidTensor);
+        }
+        input.clone()
+    };
+    let output = swiglu_f32(&input, &rhs, &input_meta, &output_meta, attr.swapped != 0)?;
     write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
 }
 
@@ -297,6 +372,7 @@ fn softmax_f32(
     meta: &TensorMeta,
     axis: usize,
     scale: f32,
+    mask: Option<&(Vec<f32>, TensorMeta)>,
     target: k3_ai_uabi::AiTargetHint,
 ) -> Result<Vec<f32>, BackendErr> {
     let scale = if scale == 0.0 { 1.0 } else { scale };
@@ -313,6 +389,11 @@ fn softmax_f32(
                 row[axis_index] = input
                     [outer_index * axis_len * inner + axis_index * inner + inner_index]
                     * scale;
+                if let Some((mask_values, mask_meta)) = mask {
+                    let linear = outer_index * axis_len * inner + axis_index * inner + inner_index;
+                    let mask_linear = broadcast_mask_linear(meta, mask_meta, linear)?;
+                    row[axis_index] += mask_values[mask_linear];
+                }
             }
             let maximum = if vector_target(target) {
                 rvv::reduce_max_f32(&row)
@@ -347,6 +428,87 @@ fn softmax_f32(
                     shifted[axis_index];
             }
         }
+    }
+    Ok(output)
+}
+
+/// Validate softmax mask broadcast compatibility.
+fn validate_softmax_mask(input: &TensorMeta, mask: &TensorMeta) -> Result<(), BackendErr> {
+    if mask.rank > input.rank {
+        return Err(BackendErr::InvalidTensor);
+    }
+    for axis in 0..input.rank {
+        let mask_dim = if axis < mask.rank {
+            mask.shape[axis]
+        } else {
+            1
+        };
+        if mask_dim != 1 && mask_dim != input.shape[axis] {
+            return Err(BackendErr::InvalidTensor);
+        }
+    }
+    Ok(())
+}
+
+/// Map an input logical linear index to a broadcast-compatible mask linear index.
+fn broadcast_mask_linear(
+    input: &TensorMeta,
+    mask: &TensorMeta,
+    input_linear: usize,
+) -> Result<usize, BackendErr> {
+    let mut input_coordinates = [0_usize; MAX_DIM];
+    input.coordinates(input_linear, &mut input_coordinates)?;
+    let mut mask_coordinates = [0_usize; MAX_DIM];
+    for axis in 0..mask.rank {
+        mask_coordinates[axis] = if mask.shape[axis] == 1 {
+            0
+        } else {
+            input_coordinates[axis]
+        };
+    }
+    row_major_linear(mask, &mask_coordinates)
+}
+
+/// SWIGLU core: `silu(lhs) * rhs`.
+fn swiglu_f32(
+    input: &[f32],
+    rhs: &[f32],
+    input_meta: &TensorMeta,
+    output_meta: &TensorMeta,
+    swapped: bool,
+) -> Result<Vec<f32>, BackendErr> {
+    let mut output = vec![0.0_f32; output_meta.element_count];
+    if input_meta.shape[..input_meta.rank] == output_meta.shape[..output_meta.rank] {
+        if rhs.len() != output.len() {
+            return Err(BackendErr::InvalidTensor);
+        }
+        for ((dst, &lhs), &rhs) in output.iter_mut().zip(input).zip(rhs) {
+            *dst = lhs / (1.0 + libm::expf(-lhs)) * rhs;
+        }
+        return Ok(output);
+    }
+
+    if input_meta.rank != output_meta.rank
+        || output_meta.shape[0]
+            .checked_mul(2)
+            .is_none_or(|expected| input_meta.shape[0] != expected)
+        || input_meta.shape[1..input_meta.rank] != output_meta.shape[1..output_meta.rank]
+        || rhs.len() != input.len()
+    {
+        return Err(BackendErr::InvalidTensor);
+    }
+
+    let nc = output_meta.shape[0];
+    for (linear, dst) in output.iter_mut().enumerate() {
+        let mut output_coordinates = [0_usize; MAX_DIM];
+        output_meta.coordinates(linear, &mut output_coordinates)?;
+        let mut lhs_coordinates = output_coordinates;
+        let mut rhs_coordinates = output_coordinates;
+        lhs_coordinates[0] += if swapped { nc } else { 0 };
+        rhs_coordinates[0] += if swapped { 0 } else { nc };
+        let lhs = input[row_major_linear(input_meta, &lhs_coordinates)?];
+        let rhs = rhs[row_major_linear(input_meta, &rhs_coordinates)?];
+        *dst = lhs / (1.0 + libm::expf(-lhs)) * rhs;
     }
     Ok(output)
 }
@@ -762,6 +924,7 @@ mod tests {
             &meta(&[2, 3]),
             1,
             1.0,
+            None,
             k3_ai_uabi::AiTargetHint::PREFER_A100,
         )
         .unwrap();
@@ -783,6 +946,26 @@ mod tests {
         let scale = 1.0 / libm::sqrtf(2.5 + 1.0e-5);
         assert!((output[0] - scale).abs() < 1.0e-5);
         assert!((output[1] - 2.0 * scale).abs() < 1.0e-5);
+    }
+
+    /// Split SwiGLU 应按 axis0 左右半区取值，而不是按物理连续行切片。
+    #[test]
+    fn swiglu_split_uses_axis0_halves() {
+        let input = [1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let output = swiglu_f32(&input, &input, &meta(&[4, 2]), &meta(&[2, 2]), false).unwrap();
+        let expected = [
+            silu_ref(1.0) * 10.0,
+            silu_ref(2.0) * 20.0,
+            silu_ref(3.0) * 30.0,
+            silu_ref(4.0) * 40.0,
+        ];
+        for (actual, expected) in output.iter().zip(expected) {
+            assert!((*actual - expected).abs() < 1.0e-5);
+        }
+    }
+
+    fn silu_ref(value: f32) -> f32 {
+        value / (1.0 + libm::expf(-value))
     }
 
     /// TopK 平局时应优先较低索引。

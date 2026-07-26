@@ -7,6 +7,7 @@ use core::ops::{Add, Mul};
 
 use crate::BackendCall;
 use crate::call::CallContext;
+use crate::quant;
 use half::f16;
 use k3_ai_uabi::error::BackendErr;
 use k3_ai_uabi::{AiDtype, AiTargetHint, DimSize, ElemStride, MatMulAttr};
@@ -229,6 +230,16 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
                 _ => unreachable!("CallContext rejects unknown targets"),
             }
         }
+        (AiDtype::F16, AiDtype::F32, AiDtype::F32) => {
+            if attr.accum_dtype != AiDtype::F32 {
+                return Err(BackendErr::UnsupportedDtype);
+            }
+            let lhs = unsafe { ctx.inputs[0].as_slice::<u16>()? };
+            let rhs = unsafe { ctx.inputs[1].as_slice::<f32>()? };
+            let out = unsafe { ctx.outputs[0].as_mut_slice::<f32>()? };
+            validate_matmul_bounds(&attr, lhs.len(), rhs.len(), out.len())?;
+            cpu_f16_f32_rhs_f32(lhs, rhs, out, &attr)
+        }
         (lhs_dtype, rhs_dtype, AiDtype::I32)
             if is_int8_dtype(lhs_dtype) && is_int8_dtype(rhs_dtype) =>
         {
@@ -260,6 +271,18 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
                 _ => unreachable!("CallContext rejects unknown targets"),
             }
         }
+        (lhs_dtype, AiDtype::F32, AiDtype::F32) if lhs_dtype.is_ggml_quant() => {
+            let lhs_meta = ctx.inputs[0].checked_quant_meta()?;
+            let rhs = unsafe { ctx.inputs[1].as_slice::<f32>()? };
+            let out = unsafe { ctx.outputs[0].as_mut_slice::<f32>()? };
+            quantized_lhs_f32_matmul(&ctx.inputs[0], &lhs_meta, rhs, out, &attr)
+        }
+        (lhs_dtype, AiDtype::F16, AiDtype::F32) if lhs_dtype.is_ggml_quant() => {
+            let lhs_meta = ctx.inputs[0].checked_quant_meta()?;
+            let rhs = unsafe { ctx.inputs[1].as_slice::<u16>()? };
+            let out = unsafe { ctx.outputs[0].as_mut_slice::<f32>()? };
+            quantized_lhs_f16_matmul(&ctx.inputs[0], &lhs_meta, rhs, out, &attr)
+        }
         _ => {
             error!(
                 "matmul_caller: unsupported dtype, input0={:?}, input1={:?}, output={:?}",
@@ -268,6 +291,189 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
             Err(BackendErr::UnsupportedDtype)
         }
     }
+}
+
+/// FP16 lhs × F32 rhs -> F32 output.
+fn cpu_f16_f32_rhs_f32(
+    lhs: &[u16],
+    rhs: &[f32],
+    out: &mut [f32],
+    attr: &MatMulAttr,
+) -> Result<(), BackendErr> {
+    let m = dim(attr.m);
+    let n = dim(attr.n);
+    let k = dim(attr.k);
+    let batch = normalized_batch(attr);
+    let out_row_stride = elem_stride(attr.out_row_stride);
+    let out_col_stride = elem_stride(attr.out_col_stride);
+    let lhs_batch_stride = elem_stride(attr.lhs_batch_stride);
+    let rhs_batch_stride = elem_stride(attr.rhs_batch_stride);
+    let out_batch_stride = elem_stride(attr.out_batch_stride);
+
+    for b in 0..batch {
+        let lhs_base = b * lhs_batch_stride;
+        let rhs_base = b * rhs_batch_stride;
+        let out_base = b * out_batch_stride;
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0_f32;
+                for p in 0..k {
+                    let lhs = f16::from_bits(lhs[lhs_index(attr, lhs_base, i, p)]).to_f32();
+                    let rhs = rhs[rhs_index(attr, rhs_base, p, j)];
+                    sum += lhs * rhs;
+                }
+                out[out_base + i * out_row_stride + j * out_col_stride] = sum;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ggml quant lhs × F32 rhs -> F32 output.
+fn quantized_lhs_f32_matmul(
+    lhs_view: &crate::BackendTensorView,
+    lhs_meta: &crate::call::QuantTensorMeta,
+    rhs: &[f32],
+    out: &mut [f32],
+    attr: &MatMulAttr,
+) -> Result<(), BackendErr> {
+    validate_quantized_lhs_matmul(lhs_meta, rhs.len(), out.len(), attr)?;
+    execute_quantized_lhs_matmul(lhs_view, lhs_meta, rhs, out, attr, |slice, index| {
+        Ok(slice[index])
+    })
+}
+
+/// ggml quant lhs × F16 rhs -> F32 output.
+fn quantized_lhs_f16_matmul(
+    lhs_view: &crate::BackendTensorView,
+    lhs_meta: &crate::call::QuantTensorMeta,
+    rhs: &[u16],
+    out: &mut [f32],
+    attr: &MatMulAttr,
+) -> Result<(), BackendErr> {
+    validate_quantized_lhs_matmul(lhs_meta, rhs.len(), out.len(), attr)?;
+    execute_quantized_lhs_matmul(lhs_view, lhs_meta, rhs, out, attr, |slice, index| {
+        Ok(f16::from_bits(slice[index]).to_f32())
+    })
+}
+
+/// Shared quantized lhs matmul loop.
+fn execute_quantized_lhs_matmul<Rhs, F>(
+    lhs_view: &crate::BackendTensorView,
+    lhs_meta: &crate::call::QuantTensorMeta,
+    rhs: &[Rhs],
+    out: &mut [f32],
+    attr: &MatMulAttr,
+    mut rhs_value: F,
+) -> Result<(), BackendErr>
+where
+    F: FnMut(&[Rhs], usize) -> Result<f32, BackendErr>,
+{
+    let m = dim(attr.m);
+    let n = dim(attr.n);
+    let k = dim(attr.k);
+    let batch = normalized_batch(attr);
+    let out_row_stride = elem_stride(attr.out_row_stride);
+    let out_col_stride = elem_stride(attr.out_col_stride);
+    let out_batch_stride = elem_stride(attr.out_batch_stride);
+    let rhs_batch_stride = elem_stride(attr.rhs_batch_stride);
+    let mut lhs_coordinates = [0_usize; k3_ai_uabi::MAX_DIM];
+
+    for b in 0..batch {
+        set_quant_batch_coordinates(lhs_meta, b, &mut lhs_coordinates)?;
+        let rhs_base = b * rhs_batch_stride;
+        let out_base = b * out_batch_stride;
+        for i in 0..m {
+            lhs_coordinates[1] = i;
+            for j in 0..n {
+                let mut sum = 0.0_f32;
+                for p in 0..k {
+                    lhs_coordinates[0] = p;
+                    let lhs = quant::read_quant_f32(lhs_view, lhs_meta, &lhs_coordinates)?;
+                    let rhs = rhs_value(rhs, rhs_index(attr, rhs_base, p, j))?;
+                    sum += lhs * rhs;
+                }
+                out[out_base + i * out_row_stride + j * out_col_stride] = sum;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate quantized lhs matmul bounds and supported flags.
+fn validate_quantized_lhs_matmul(
+    lhs_meta: &crate::call::QuantTensorMeta,
+    rhs_len: usize,
+    out_len: usize,
+    attr: &MatMulAttr,
+) -> Result<(), BackendErr> {
+    let m = dim(attr.m);
+    let n = dim(attr.n);
+    let k = dim(attr.k);
+    let batch = normalized_batch(attr);
+    if m == 0
+        || n == 0
+        || k == 0
+        || lhs_transposed(attr)
+        || lhs_meta.rank < 2
+        || lhs_meta.shape[0] < k
+        || lhs_meta.shape[1] < m
+        || attr.accum_dtype != AiDtype::F32
+    {
+        return Err(BackendErr::InvalidAttr);
+    }
+    let lhs_batches = lhs_meta.shape[2..lhs_meta.rank]
+        .iter()
+        .try_fold(1_usize, |product, &dim| product.checked_mul(dim))
+        .ok_or(BackendErr::InvalidTensor)?;
+    if lhs_batches != 1 && lhs_batches < batch {
+        return Err(BackendErr::InvalidTensor);
+    }
+    let last_rhs = rhs_index(
+        attr,
+        (batch - 1) * elem_stride(attr.rhs_batch_stride),
+        k - 1,
+        n - 1,
+    );
+    let last_out = (batch - 1)
+        .checked_mul(elem_stride(attr.out_batch_stride))
+        .and_then(|base| {
+            let with_row =
+                base.checked_add((m - 1).checked_mul(elem_stride(attr.out_row_stride))?)?;
+            with_row.checked_add((n - 1).checked_mul(elem_stride(attr.out_col_stride))?)
+        })
+        .ok_or(BackendErr::InvalidTensor)?;
+    if last_rhs >= rhs_len || last_out >= out_len {
+        return Err(BackendErr::InvalidTensor);
+    }
+    Ok(())
+}
+
+/// Map flattened batch index to quant tensor axes 2..rank, with batch broadcast.
+fn set_quant_batch_coordinates(
+    meta: &crate::call::QuantTensorMeta,
+    batch_index: usize,
+    coordinates: &mut [usize; k3_ai_uabi::MAX_DIM],
+) -> Result<(), BackendErr> {
+    for coordinate in coordinates.iter_mut().take(meta.rank).skip(2) {
+        *coordinate = 0;
+    }
+    let batch_count = meta.shape[2..meta.rank]
+        .iter()
+        .try_fold(1_usize, |product, &dim| product.checked_mul(dim))
+        .ok_or(BackendErr::InvalidTensor)?;
+    if batch_count <= 1 {
+        return Ok(());
+    }
+    if batch_index >= batch_count {
+        return Err(BackendErr::InvalidTensor);
+    }
+    let mut remaining = batch_index;
+    for (axis, coordinate) in coordinates.iter_mut().enumerate().take(meta.rank).skip(2) {
+        *coordinate = remaining % meta.shape[axis];
+        remaining /= meta.shape[axis];
+    }
+    Ok(())
 }
 
 /// A100 加速器 matmul 实现。

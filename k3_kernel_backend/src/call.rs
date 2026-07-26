@@ -215,6 +215,89 @@ impl BackendTensorView {
             element_count,
         })
     }
+
+    /// 校验 ggml 量化 tensor 的 dtype、rank、shape、stride 和 buffer bounds。
+    pub(crate) fn checked_quant_meta(&self) -> Result<QuantTensorMeta, BackendErr> {
+        let rank = self
+            .ndim
+            .try_under_max(MAX_DIM)
+            .map_err(|_| BackendErr::InvalidTensor)?;
+        if rank == 0 || self.data.is_null() || self.layout != AiTensorLayout::GGML_QUANT {
+            return Err(BackendErr::InvalidTensor);
+        }
+        let block_size = self
+            .dtype
+            .ggml_quant_block_size()
+            .ok_or(BackendErr::UnsupportedDtype)? as usize;
+        let block_bytes = self
+            .dtype
+            .ggml_quant_block_bytes()
+            .ok_or(BackendErr::UnsupportedDtype)? as usize;
+        if self.quant_block_size_hint() != 0 && self.quant_block_size_hint() != block_size {
+            return Err(BackendErr::InvalidTensor);
+        }
+
+        let byte_len = self
+            .byte_len
+            .try_as_usize()
+            .map_err(|_| BackendErr::InvalidTensor)?;
+        let mut shape = [0_usize; MAX_DIM];
+        let mut stride_bytes = [0_usize; MAX_DIM];
+        let mut element_count = 1_usize;
+        let mut max_offset = 0_usize;
+        for axis in 0..rank {
+            shape[axis] = self.shape[axis]
+                .try_as_usize()
+                .map_err(|_| BackendErr::InvalidTensor)?;
+            stride_bytes[axis] = self.stride_bytes[axis]
+                .try_as_usize()
+                .map_err(|_| BackendErr::InvalidTensor)?;
+            if shape[axis] > 1 && stride_bytes[axis] == 0 {
+                return Err(BackendErr::InvalidTensor);
+            }
+            element_count = element_count
+                .checked_mul(shape[axis])
+                .ok_or(BackendErr::InvalidTensor)?;
+        }
+        if shape[0] == 0 || !shape[0].is_multiple_of(block_size) {
+            return Err(BackendErr::InvalidTensor);
+        }
+        if stride_bytes[0] != block_bytes {
+            return Err(BackendErr::InvalidTensor);
+        }
+        for axis in 1..rank {
+            max_offset = max_offset
+                .checked_add(
+                    shape[axis]
+                        .saturating_sub(1)
+                        .checked_mul(stride_bytes[axis])
+                        .ok_or(BackendErr::InvalidTensor)?,
+                )
+                .ok_or(BackendErr::InvalidTensor)?;
+        }
+        let last_row_bytes = (shape[0] / block_size)
+            .checked_mul(block_bytes)
+            .ok_or(BackendErr::InvalidTensor)?;
+        if max_offset
+            .checked_add(last_row_bytes)
+            .is_none_or(|required| required > byte_len)
+        {
+            return Err(BackendErr::InvalidTensor);
+        }
+        Ok(QuantTensorMeta {
+            rank,
+            shape,
+            stride_bytes,
+            block_size,
+            block_bytes,
+            element_count,
+        })
+    }
+
+    /// 返回 desc 内量化 block size hint。0 表示调用方未填写。
+    fn quant_block_size_hint(&self) -> usize {
+        0
+    }
 }
 
 /// 已校验、以元素为单位的 tensor 元数据。
@@ -230,6 +313,51 @@ pub(crate) struct TensorMeta {
     pub(crate) element_size: usize,
     /// 逻辑元素数量。
     pub(crate) element_count: usize,
+}
+
+/// 已校验的 ggml 量化 tensor 元数据。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuantTensorMeta {
+    /// 有效维度数。
+    pub(crate) rank: usize,
+    /// 逻辑 shape。
+    pub(crate) shape: [usize; MAX_DIM],
+    /// 每个逻辑轴的字节 stride；第 0 维是 block stride。
+    pub(crate) stride_bytes: [usize; MAX_DIM],
+    /// 单个 block 内逻辑元素数。
+    pub(crate) block_size: usize,
+    /// 单个 block 物理字节数。
+    pub(crate) block_bytes: usize,
+    /// 逻辑元素数量。
+    pub(crate) element_count: usize,
+}
+
+impl QuantTensorMeta {
+    /// 返回指定逻辑坐标所在量化 block 的字节偏移和 block 内元素下标。
+    pub(crate) fn block_offset_for_coordinates(
+        &self,
+        coordinates: &[usize; MAX_DIM],
+    ) -> Result<(usize, usize), BackendErr> {
+        if coordinates[0] >= self.shape[0] {
+            return Err(BackendErr::InvalidTensor);
+        }
+        let mut offset = (coordinates[0] / self.block_size)
+            .checked_mul(self.block_bytes)
+            .ok_or(BackendErr::InvalidTensor)?;
+        for (axis, &coordinate) in coordinates.iter().enumerate().take(self.rank).skip(1) {
+            if coordinate >= self.shape[axis] {
+                return Err(BackendErr::InvalidTensor);
+            }
+            offset = offset
+                .checked_add(
+                    coordinate
+                        .checked_mul(self.stride_bytes[axis])
+                        .ok_or(BackendErr::InvalidTensor)?,
+                )
+                .ok_or(BackendErr::InvalidTensor)?;
+        }
+        Ok((offset, coordinates[0] % self.block_size))
+    }
 }
 
 impl TensorMeta {

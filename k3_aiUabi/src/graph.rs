@@ -5,7 +5,6 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use bitflags::bitflags;
 use core::mem;
 
 use crate::{
@@ -164,22 +163,10 @@ pub struct AiGraphNode {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AiGraphState {
-    /// 该节点是否已执行完成。
-    complete: bool,
-    /// 错误原因位图，按 `GraphAiErrorFlags` 解释。
-    error_flag: u8,
-}
-
-bitflags! {
-    /// graph 节点执行错误原因位标志。
-    pub struct GraphAiErrorFlags: u32 {
-        /// 错误原因位 A。
-        const A = 0b00000001;
-        /// 错误原因位 B。
-        const B = 0b00000010;
-        /// 错误原因位 C。
-        const C = 0b00000100;
-    }
+    /// 该节点是否已执行完成：0=未完成，1=已完成。
+    pub complete: u8,
+    /// 错误码：0 表示无错误，非零为 `BackendErr as u8`。
+    pub error_flag: u8,
 }
 
 /// graph 依赖边。
@@ -738,7 +725,7 @@ mod abi_layout {
 
     #[repr(C)]
     struct RawAiGraphState {
-        complete: bool,
+        complete: u8,
         error_flag: u8,
     }
 
