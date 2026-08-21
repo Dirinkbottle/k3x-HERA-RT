@@ -11,6 +11,7 @@
 - [提交仓库目录和文件描述](./repository-structure.md)
 - [怎么使用/复现本项目](./how_to_use.md)
 - [特别说明和信息](./information.md)
+- [k3的RawPerfEvent映射](./k3_pmu.md)
 
 - [开发日志](./开发日志/index.md)
   - [周报](./开发日志/周报/index.md)
