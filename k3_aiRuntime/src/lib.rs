@@ -7,5 +7,6 @@
 #![deny(clippy::missing_docs_in_private_items)]
 #![deny(nonstandard_style)]
 pub mod fronted;
+pub mod ort_ffi;
 #[cfg(test)]
 pub mod test;

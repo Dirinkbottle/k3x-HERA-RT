@@ -176,7 +176,6 @@ pub struct AiTensorDesc {
     pub ndim: DimCount,
 
     /// tensor flags。具体含义由 frontend/backend 约定。
-    /// TODO:
     pub flags: TensorFlags,
 
     /// 预留字段，ABI 扩展留空间。

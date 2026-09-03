@@ -8,6 +8,7 @@
 use std::{
     fs::{File, OpenOptions},
     io,
+    marker::PhantomData,
     mem::size_of,
     os::{
         fd::AsRawFd,
@@ -167,6 +168,65 @@ impl MmapMemory {
     }
 }
 
+/// 对调用方已有用户态地址的非拥有视图。
+///
+/// 这个类型不调用 `mmap`、不拥有也不会在 Drop 时 `munmap` 这段内存。K3 内核在
+/// graph submit 时通过 `map_user_to_kernel` 固定页面并创建 kernel alias；因此 view
+/// 的 Rust 生命周期只需要覆盖同步的 submit + completion 区间。
+///
+/// `PhantomData<*mut ()>` 故意让它不能跨线程发送或共享。FFI 调用者承诺 buffer
+/// 在 `k3_ort_run_node` 返回前保持有效，runtime 不应把这个借用扩展到该调用之外。
+pub(crate) struct BorrowedMemory {
+    /// 借用的用户态首地址。
+    ptr: *mut u8,
+    /// 借用范围的字节数。
+    len: usize,
+    /// 禁止将调用方内存借用跨线程移动。
+    _not_send_or_sync: PhantomData<*mut ()>,
+}
+
+impl BorrowedMemory {
+    /// 从调用方拥有的连续用户态 buffer 建立一个非拥有 view。
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr + len` 必须在返回的 `BorrowedMemory` 生命周期内保持有效、可访问，
+    /// 且不得由此 view 之外的并发访问破坏 Rust 的别名规则。
+    pub(crate) unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> io::Result<Self> {
+        if ptr.is_null() || len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "borrowed buffer is null or empty",
+            ));
+        }
+
+        let _end = (ptr as usize)
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer range overflows"))?;
+
+        Ok(Self {
+            ptr,
+            len,
+            _not_send_or_sync: PhantomData,
+        })
+    }
+
+    /// 借用范围的只读首地址。
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr.cast_const()
+    }
+
+    /// 借用范围的可写首地址。
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// 借用范围的字节数。
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
 /// 打开 `/dev/k3_airunner`，mmap 共享内存并通过 `BUILD_CHANNEL` ioctl 让内核保活。
 /// 进程内只允许第一次调用真正执行 ioctl；后续调用复用已建立的共享内存，
 /// 不再重复 open/mmap/ioctl，内核侧也有幂等保护作为双重保障。
@@ -177,13 +237,11 @@ pub fn build_channel() -> Result<UringChannel, AiRuntimeErr> {
             let slot = CHANNEL_MEMORY
                 .lock()
                 .map_err(|_| AiRuntimeErr::IoctlFailed)?;
-            slot.clone()
-                .ok_or(AiRuntimeErr::ChannelNotInitialized)?
+            slot.clone().ok_or(AiRuntimeErr::ChannelNotInitialized)?
         };
         let shared_ptr = memory.as_ptr() as usize;
 
-        let shm =
-            unsafe { ov_channels::SharedMemory::<K3_CHANNEL_COUNT>::at(shared_ptr) };
+        let shm = unsafe { ov_channels::SharedMemory::<K3_CHANNEL_COUNT>::at(shared_ptr) };
         let sender_channel_0 = shm
             .sender(ChannelId::new(K3_CHANNEL_SNEDERID))
             .map_err(|_| AiRuntimeErr::ChannelNotInitialized)?;
@@ -336,15 +394,13 @@ pub fn wait_graph_complete(
         // 新版 completion 走 Message::data，携带 AiCompletion。
         if let Some(payload) = msg.as_data() {
             if payload.len() >= core::mem::size_of::<AiCompletion>() {
-                let completion = unsafe {
-                    core::ptr::read_unaligned(payload.as_ptr().cast::<AiCompletion>())
-                };
+                let completion =
+                    unsafe { core::ptr::read_unaligned(payload.as_ptr().cast::<AiCompletion>()) };
                 if completion.user_token == graph_entry.user_token.get() {
                     if completion.status == 0 {
-                       
                         return Ok(());
                     }
-               
+
                     return Err(AiRuntimeErr::GraphExecutionFailed {
                         node_id: completion.failed_node_id,
                         op: completion.failed_node_op,
