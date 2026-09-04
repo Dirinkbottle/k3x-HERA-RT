@@ -15,7 +15,7 @@ pub mod scheduler;
 
 /// 调度器需要的操作系统接口。
 #[allow(clippy::result_unit_err)]
-pub trait K3SchedulerOps: Sync {
+pub trait K3SchedulerOps: Send + Sync {
     /// 返回当前调用路径实际运行的 CPU core id。
     ///
     /// 调度器用这个 id 选择 per-core queue，避免在一个 core 上提交却写入另一个

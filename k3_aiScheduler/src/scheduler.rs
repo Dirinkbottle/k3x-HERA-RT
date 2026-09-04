@@ -192,6 +192,8 @@ impl PerCoreTaskQueue {
 pub struct AINodeUnit {
     /// 用户提交时携带的 completion token。
     pub user_token: UserToken,
+    /// 负责释放本次 graph tensor kernel alias 的宿主回调。
+    pub caller: Box<dyn K3SchedulerOps>,
     /// 内核已 pin 的 completion channel sender。
     pub complete_sender: Sender<'static>,
     /// 已按依赖关系收敛的 graph 节点链。
@@ -438,6 +440,7 @@ pub fn run_graph(
     let scheduler = ensure_scheduler(caller.as_ref(), submit_core_id)?;
     let unit = AINodeUnit {
         user_token,
+        caller,
         complete_sender,
         tasklink,
     };
@@ -458,26 +461,67 @@ pub fn run_graph(
     Ok(())
 }
 
-/// GDB 调试开关：设为 1 后 worker 下一次到达探针点会触发 `ebreak` 陷入 GDB。
-/// 在 GDB 里执行 `set var DEBUG_TRAP = 1` 即可激活。
-#[unsafe(no_mangle)]
-static DEBUG_TRAP: AtomicU32 = AtomicU32::new(0);
 
-/// RISC-V `ebreak` 调试桩；非 RISC-V 目标为空操作。
-#[inline(always)]
-fn debug_trap() {
-    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-    unsafe {
-        core::arch::asm!("ebreak");
-    }
-}
 
-/// 如果调试开关打开，触发一次 ebreak 并复位开关。
-#[inline(always)]
-fn debug_trap_once() {
-    if DEBUG_TRAP.load(Ordering::Relaxed) != 0 {
-        DEBUG_TRAP.store(0, Ordering::Relaxed);
-        debug_trap();
+/// 释放一张 graph 在 submit 阶段为 tensor 创建的所有 kernel alias。
+///
+/// 这必须在 worker 停止访问 tensor 后执行。失败时继续释放剩余映射并只记录日志，
+/// 因为 caller 仍应收到该 graph 的 completion，不能让一个清理失败卡死 worker。
+fn release_tensor_mappings(caller: &dyn K3SchedulerOps, tasklink: &TaskLink, token: UserToken) {
+    for node in tasklink.iter() {
+        let total_count = match node.desc.input_count.checked_total(node.desc.output_count) {
+            Ok(total_count) if total_count <= node.desc.tensors.len() => total_count,
+            Ok(total_count) => {
+                error!(
+                    "worker mapping cleanup rejected oversized tensor count: token={}, node_id={}, \
+                     total={}, capacity={}",
+                    token,
+                    node.node_id,
+                    total_count,
+                    node.desc.tensors.len()
+                );
+                continue;
+            }
+            Err(error) => {
+                error!(
+                    "worker mapping cleanup rejected invalid tensor count: token={}, node_id={}, \
+                     error={:?}",
+                    token, node.node_id, error
+                );
+                continue;
+            }
+        };
+
+        for tensor in &node.desc.tensors[..total_count] {
+            let kernel_va = tensor.kernel_va.get();
+            if kernel_va == 0 {
+                continue;
+            }
+            let size_bytes = match tensor.size_bytes.try_as_usize() {
+                Ok(size_bytes) if size_bytes != 0 => size_bytes,
+                Ok(_) | Err(_) => {
+                    error!(
+                        "worker mapping cleanup rejected invalid tensor size: token={}, node_id={}, \
+                         kernel_va={:#x}, size={:#x}",
+                        token,
+                        node.node_id,
+                        kernel_va,
+                        tensor.size_bytes.get()
+                    );
+                    continue;
+                }
+            };
+
+            // SAFETY: `kernel_va` and `size_bytes` came from this graph's prior
+            // successful `map_user_to_kernel` call. No backend work remains.
+            if unsafe { caller.unmap_user(kernel_va, size_bytes) }.is_err() {
+                error!(
+                    "worker mapping cleanup failed: token={}, node_id={}, kernel_va={:#x}, \
+                     size={:#x}",
+                    token, node.node_id, kernel_va, size_bytes
+                );
+            }
+        }
     }
 }
 
@@ -547,18 +591,9 @@ pub fn worker(arg: usize) {
     loop {
         loop_iters = loop_iters.wrapping_add(1);
 
-        // ── GDB 探针 A：主循环心跳，每轮都可通过 DEBUG_TRAP 激活 ──
-        debug_trap_once();
 
         if let Some(mut unit) = scheduler.take_task_for_core(expected_core_id) {
-            // ── GDB 探针 B：取到任务，进入执行分枝 ──
-            debug_trap_once();
-            warn!(
-                "worker got task: token={}, node_count={}, loop_iter={}",
-                unit.user_token,
-                unit.tasklink.ordered_nodes.len(),
-                loop_iters
-            );
+
             slot.worker_busy.store(true, Ordering::Release);
             slot.worker_token
                 .store(unit.user_token.get(), Ordering::Release);
@@ -572,15 +607,7 @@ pub fn worker(arg: usize) {
                     "worker run node begin: token={}, node_id={}, op={:?}",
                     unit.user_token, node.node_id, node.desc.op
                 );
-                // ── GDB 探针 C：即将执行 k3_run_kernel ──
-                debug_trap_once();
                 let ret = unsafe { k3_run_kernel(node) };
-                // ── GDB 探针 D：k3_run_kernel 已返回 ──
-                debug_trap_once();
-                warn!(
-                    "worker run node end: token={}, node_id={}, op={:?}, ret={}",
-                    unit.user_token, node.node_id, node.desc.op, ret
-                );
                 if ret != 0 {
                     error!(
                         "k3_run_kernel failed: node_id={}, op={:?}, ret={}, error_flag={}",
@@ -600,6 +627,10 @@ pub fn worker(arg: usize) {
                 "worker all nodes done: token={}, success={}",
                 unit.user_token, success
             );
+
+            // k3_run_kernel 已经不再引用 graph 的 tensor。先撤销本次提交创建的
+            // kernel alias，完成消息发出后用户即可安全复用或释放原 tensor buffer。
+            release_tensor_mappings(unit.caller.as_ref(), &unit.tasklink, unit.user_token);
 
             warn!(
                 "worker completion send begin: token={}, success={}",
@@ -645,8 +676,6 @@ pub fn worker(arg: usize) {
             );
             idle_spins = 0;
         } else {
-            // ── GDB 探针 E：队列为空，进入 idle 分枝 ──
-            debug_trap_once();
             idle_spins = idle_spins.wrapping_add(1);
             if idle_spins.is_multiple_of(80_000_000) {
                 warn!(
@@ -667,12 +696,44 @@ pub fn worker(arg: usize) {
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use k3_ai_uabi::{AiGraphNode, AiKernelDesc, ByteSize, KernelVa, TensorCount};
     use ov_channels::{ChannelId, SharedMemory};
     extern crate std;
     use self::std::{sync::Arc, thread};
 
     /// 测试任务共用的静态 completion channel。
     static TEST_CHANNELS: SharedMemory<2> = SharedMemory::new();
+    /// 记录 cleanup 请求数，验证每个有效 tensor alias 都会被释放。
+    static TEST_UNMAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// 不接触真实地址空间的 scheduler 宿主。
+    struct TestCaller;
+
+    impl K3SchedulerOps for TestCaller {
+        fn current_core_id(&self) -> u32 {
+            0
+        }
+
+        unsafe fn copy_from_user(&self, _user_va: u64, _buf: &mut [u8]) -> Result<(), ()> {
+            Err(())
+        }
+
+        unsafe fn copy_to_user(&self, _user_va: u64, _buf: &[u8]) -> Result<(), ()> {
+            Err(())
+        }
+
+        unsafe fn map_user_to_kernel(&self, _user_va: u64, _len: usize) -> Result<u64, ()> {
+            Err(())
+        }
+
+        unsafe fn unmap_user(&self, _kernel_va: u64, _len: usize) -> Result<(), ()> {
+            TEST_UNMAP_COUNT.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn spawn_thread_on_core(&self, _core_id: u32, _f: fn(usize), _arg: usize) {}
+    }
 
     /// 构造不含节点的任务，队列测试只观察 token 和所有权移动。
     fn unit(token: u32) -> AINodeUnit {
@@ -681,6 +742,7 @@ mod tests {
             .expect("test channel id should be valid");
         AINodeUnit {
             user_token: UserToken::new(token),
+            caller: Box::new(TestCaller),
             complete_sender: sender,
             tasklink: TaskLink {
                 pid: 0,
@@ -691,6 +753,38 @@ mod tests {
                 ordered_nodes: Vec::new(),
             },
         }
+    }
+
+    /// worker 收尾必须释放所有已成功创建的 input/output kernel alias。
+    #[test]
+    fn cleanup_releases_every_tensor_mapping() {
+        let mut desc = AiKernelDesc {
+            input_count: TensorCount::new(1),
+            output_count: TensorCount::new(1),
+            ..AiKernelDesc::default()
+        };
+        desc.tensors[0].kernel_va = KernelVa::new(0x1000);
+        desc.tensors[0].size_bytes = ByteSize::new(64);
+        desc.tensors[1].kernel_va = KernelVa::new(0x2000);
+        desc.tensors[1].size_bytes = ByteSize::new(128);
+
+        let tasklink = TaskLink {
+            pid: 0,
+            head_node: None,
+            tail_node: None,
+            next_node: Vec::new(),
+            node_order: Vec::new(),
+            ordered_nodes: Vec::from([AiGraphNode {
+                node_id: Default::default(),
+                desc,
+                state: Default::default(),
+            }]),
+        };
+        let before = TEST_UNMAP_COUNT.load(Ordering::Relaxed);
+
+        release_tensor_mappings(&TestCaller, &tasklink, UserToken::new(1));
+
+        assert_eq!(TEST_UNMAP_COUNT.load(Ordering::Relaxed), before + 2);
     }
 
     /// 入队三个任务后应按 FIFO 顺序弹出。

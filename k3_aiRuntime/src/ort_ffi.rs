@@ -3,12 +3,9 @@
 //! The shim keeps K3 runtime graph construction on the Rust side. ORT passes a
 //! single lowered node with raw tensor buffers and inline attr bytes; this module
 //! builds zero-copy `TensorManager` views over those buffers, creates a one-node
-//! graph, and either submits it to `/dev/k3_airunner` or executes the CPU backend
-//! when built with the `host-cpu` feature.
+//! graph, then synchronously submits it to `/dev/k3_airunner`.
 
-#[cfg(not(feature = "host-cpu"))]
 use std::sync::Mutex;
-#[cfg(not(feature = "host-cpu"))]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{ffi::c_char, fmt};
@@ -17,7 +14,6 @@ use crate::fronted::{
     ATTR_INLINE_SIZE, AiKernelDesc, AiTargetHint, AiTensorFormat, AiTensorLayout, AttrByteSize,
     KernelOp, MAX_DIM, MAX_SUBMIT_TENSORS, Tensor, TensorCount, TensorManager,
 };
-#[cfg(not(feature = "host-cpu"))]
 use crate::fronted::{
     GraphManager, UserToken,
     kd_uring::{UringChannel, build_channel, submit_graph, wait_graph_complete},
@@ -51,13 +47,11 @@ pub enum K3OrtStatus {
 }
 
 /// Monotonic token source for single-node graph submissions.
-#[cfg(not(feature = "host-cpu"))]
 static NEXT_TOKEN: AtomicU32 = AtomicU32::new(0x4B33_1000);
 
 /// Number of successfully completed ORT-submitted nodes in this process.
 static EXECUTED_NODE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(not(feature = "host-cpu"))]
 lazy_static::lazy_static! {
     /// Lazily-opened runtime channel for device submissions.
     static ref CHANNEL: Mutex<Option<UringChannel>> = Mutex::new(None);
@@ -200,7 +194,7 @@ fn run_node(req: &K3OrtRunNode) -> Result<(), K3OrtStatus> {
 
     let desc = build_desc(req, &tensors);
     trace(format_args!("stage=descriptor op={}", desc.op.0));
-    execute_desc(&desc)?;
+    execute_on_device(&desc)?;
     EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
 
     Ok(())
@@ -355,19 +349,7 @@ fn build_desc(req: &K3OrtRunNode, staged: &[Tensor]) -> AiKernelDesc {
     };
 
     for (index, tensor) in staged.iter().enumerate() {
-        let tensor_desc = {
-            #[cfg(feature = "host-cpu")]
-            {
-                let mut tensor_desc = tensor.desc();
-                tensor_desc.kernel_va = crate::fronted::KernelVa::new(tensor_desc.user_va.get());
-                tensor_desc
-            }
-            #[cfg(not(feature = "host-cpu"))]
-            {
-                tensor.desc()
-            }
-        };
-        desc.tensors[index] = tensor_desc;
+        desc.tensors[index] = tensor.desc();
     }
 
     desc.attr_inline[..req.attr_size as usize]
@@ -375,45 +357,7 @@ fn build_desc(req: &K3OrtRunNode, staged: &[Tensor]) -> AiKernelDesc {
     desc
 }
 
-/// Dispatch one kernel descriptor to the backend selected at compile time.
-fn execute_desc(desc: &AiKernelDesc) -> Result<(), K3OrtStatus> {
-    #[cfg(feature = "host-cpu")]
-    {
-        execute_on_host_cpu(desc)
-    }
-
-    #[cfg(not(feature = "host-cpu"))]
-    {
-        execute_on_device(desc)
-    }
-}
-
-/// Execute the descriptor synchronously with the in-process CPU backend.
-#[cfg(feature = "host-cpu")]
-fn execute_on_host_cpu(desc: &AiKernelDesc) -> Result<(), K3OrtStatus> {
-    use crate::fronted::AiGraphNode;
-
-    let mut node = AiGraphNode {
-        node_id: crate::fronted::AiGraphNodeId::new(0),
-        desc: *desc,
-        state: crate::fronted::AiGraphState::default(),
-    };
-    // SAFETY: `build_desc` filled tensor kernel VAs with runtime-owned buffers
-    // whose lifetimes cover this synchronous call.
-    let result = unsafe { k3_kernel_backend::k3_run_kernel(&mut node) };
-    if result == 0 {
-        Ok(())
-    } else {
-        trace(format_args!(
-            "stage=host-run op={} error={result}",
-            desc.op.0
-        ));
-        Err(K3OrtStatus::ExecutionFailed)
-    }
-}
-
 /// Build a one-node graph and submit it to the shared K3 device channel.
-#[cfg(not(feature = "host-cpu"))]
 fn execute_on_device(desc: &AiKernelDesc) -> Result<(), K3OrtStatus> {
     let operation = desc.op.0;
     let mut graph = GraphManager::new();
@@ -472,7 +416,6 @@ fn execute_on_device(desc: &AiKernelDesc) -> Result<(), K3OrtStatus> {
 }
 
 /// Convert a failed device operation into the stable C ABI execution status.
-#[cfg(not(feature = "host-cpu"))]
 fn device_step<T, E: fmt::Debug>(
     stage: &str,
     operation: u8,
@@ -574,31 +517,5 @@ mod tests {
         req.tensors[1] = dense_tensor(&mut output, &[2]);
         req.tensors[0].layout = AiTensorLayout::STRIDED.0;
         assert_eq!(run_node(&req), Err(K3OrtStatus::InvalidTensor));
-    }
-
-    #[cfg(feature = "host-cpu")]
-    #[test]
-    fn host_cpu_sigmoid_round_trip() {
-        use crate::fronted::UnaryAttr;
-
-        let mut input = [0.0_f32, 1.0];
-        let mut output = [0.0_f32; 2];
-        let mut req = request();
-        req.tensors[0] = dense_tensor(&mut input, &[2]);
-        req.tensors[1] = dense_tensor(&mut output, &[2]);
-        let attr = UnaryAttr::default();
-        req.attr_size = core::mem::size_of::<UnaryAttr>() as u32;
-        // SAFETY: UnaryAttr is repr(C), plain data, and the destination has enough space.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (&attr as *const UnaryAttr).cast::<u8>(),
-                req.attr_inline.as_mut_ptr(),
-                core::mem::size_of::<UnaryAttr>(),
-            );
-        }
-
-        assert_eq!(run_node(&req), Ok(()));
-        assert!((output[0] - 0.5).abs() < 1.0e-6);
-        assert!((output[1] - 0.731_058_6).abs() < 1.0e-6);
     }
 }
