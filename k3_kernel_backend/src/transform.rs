@@ -54,6 +54,47 @@ pub(crate) unsafe fn concat_caller(call: *const BackendCall) -> Result<(), Backe
     let target = ctx.target;
     let inner = product(&output_meta.shape[axis + 1..output_meta.rank])?;
     let outer = product(&output_meta.shape[..axis])?;
+
+    // 正常 NCHW/NHWC tensor 不需要先按 stride 物化为 logical buffer。
+    // 直接按 axis 两侧的连续 block 写入 output，避免逐元素 offset/gather。
+    if output_meta.is_contiguous() && metas.iter().all(TensorMeta::is_contiguous) {
+        let output = unsafe { ctx.outputs[0].as_mut_slice::<u8>()? };
+        let output_block_bytes = output_meta.shape[axis]
+            .checked_mul(inner)
+            .and_then(|elements| elements.checked_mul(element_size))
+            .ok_or(BackendErr::InvalidTensor)?;
+
+        for outer_index in 0..outer {
+            let mut destination_start = outer_index
+                .checked_mul(output_block_bytes)
+                .ok_or(BackendErr::InvalidTensor)?;
+            for (input, meta) in ctx.inputs.iter().zip(&metas) {
+                let block_bytes = meta.shape[axis]
+                    .checked_mul(inner)
+                    .and_then(|elements| elements.checked_mul(element_size))
+                    .ok_or(BackendErr::InvalidTensor)?;
+                let source_start = outer_index
+                    .checked_mul(block_bytes)
+                    .ok_or(BackendErr::InvalidTensor)?;
+                let source_end = source_start
+                    .checked_add(block_bytes)
+                    .ok_or(BackendErr::InvalidTensor)?;
+                let destination_end = destination_start
+                    .checked_add(block_bytes)
+                    .ok_or(BackendErr::InvalidTensor)?;
+                let source = unsafe { input.as_slice::<u8>()? }
+                    .get(source_start..source_end)
+                    .ok_or(BackendErr::InvalidTensor)?;
+                let destination = output
+                    .get_mut(destination_start..destination_end)
+                    .ok_or(BackendErr::InvalidTensor)?;
+                copy_for_target(target, source, destination)?;
+                destination_start = destination_end;
+            }
+        }
+        return Ok(());
+    }
+
     let mut logical_output = vec![0_u8; output_meta.element_count * element_size];
     for outer_index in 0..outer {
         let mut destination_axis = 0_usize;
@@ -682,6 +723,17 @@ pub(crate) fn read_logical_bytes(
     meta: &TensorMeta,
     target: AiTargetHint,
 ) -> Result<Vec<u8>, BackendErr> {
+    let logical_len = meta
+        .element_count
+        .checked_mul(meta.element_size)
+        .ok_or(BackendErr::InvalidTensor)?;
+        // 本来就连续的话就直接返回
+    if meta.is_contiguous() {
+            return raw
+            .get(..logical_len)
+            .ok_or(BackendErr::InvalidTensor)
+            .map(<[u8]>::to_vec);
+    }
     let mut offsets = vec![0_u64; meta.element_count];
     for (linear, offset) in offsets.iter_mut().enumerate() {
         *offset = (meta.offset_for_linear(linear)? * meta.element_size) as u64;
@@ -1157,6 +1209,10 @@ fn nearest_coordinate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackendTensorView;
+    use k3_ai_uabi::{
+        AiTensorLayout, AttrByteSize, ByteSize, ByteStride, DimCount, DimSize, TensorCount,
+    };
 
     /// 构造 contiguous meta。
     fn meta(shape: &[usize], element_size: usize) -> TensorMeta {
@@ -1177,12 +1233,77 @@ mod tests {
         }
     }
 
+    /// 以连续 f32 slice 构造后端 tensor view。
+    fn contiguous_f32_view(data: *mut f32, len: usize, shape: &[usize]) -> BackendTensorView {
+        let mut view_shape = [DimSize::new(0); MAX_DIM];
+        let mut stride_bytes = [ByteStride::new(0); MAX_DIM];
+        let mut stride = core::mem::size_of::<f32>() as u64;
+        for axis in (0..shape.len()).rev() {
+            view_shape[axis] = DimSize::new(shape[axis] as u32);
+            stride_bytes[axis] = ByteStride::new(stride);
+            stride *= shape[axis] as u64;
+        }
+        BackendTensorView {
+            data: data.cast::<u8>(),
+            byte_len: ByteSize::new((len * core::mem::size_of::<f32>()) as u64),
+            shape: view_shape,
+            stride_bytes,
+            ndim: DimCount::new(shape.len() as u32),
+            dtype: AiDtype::F32,
+            layout: AiTensorLayout::DENSE,
+            ..BackendTensorView::default()
+        }
+    }
+
+    /// 把 ABI attr 暴露成只读字节。
+    fn attr_bytes<T: Copy>(attr: &T) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts((attr as *const T).cast::<u8>(), core::mem::size_of::<T>())
+        }
+    }
+
     /// indexed gather 应保持 offset 顺序。
     #[test]
     fn gather_logical_reorders_elements() {
         let source = [1_u8, 2, 3, 4];
         let output = gather_logical(&source, &[3, 1, 0], 1, AiTargetHint::PREFER_A100).unwrap();
         assert_eq!(output, [4, 2, 1]);
+    }
+
+    /// 连续 concat 应直接按每个 batch 的连续 block 复制。
+    #[test]
+    fn concat_contiguous_copies_axis_blocks() {
+        let c = [1.0_f32, 2.0, 3.0, 4.0];
+        let b = [10.0_f32, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0];
+        let mut y = [0.0_f32; 12];
+        let inputs = [
+            contiguous_f32_view(c.as_ptr() as *mut f32, c.len(), &[2, 1, 2]),
+            contiguous_f32_view(b.as_ptr() as *mut f32, b.len(), &[2, 2, 2]),
+        ];
+        let mut outputs = [contiguous_f32_view(y.as_mut_ptr(), y.len(), &[2, 3, 2])];
+        let attr = ConcatAttr {
+            axis: k3_ai_uabi::TensorAxis::new(1),
+            ..ConcatAttr::default()
+        };
+        let attr = attr_bytes(&attr);
+        let call = BackendCall {
+            op: k3_ai_uabi::KernelOp::CONCAT,
+            target: AiTargetHint::PREFER_CPU.0,
+            inputs: inputs.as_ptr(),
+            input_count: TensorCount::new(inputs.len() as u32),
+            outputs: outputs.as_mut_ptr(),
+            output_count: TensorCount::new(outputs.len() as u32),
+            attr: attr.as_ptr(),
+            attr_size: AttrByteSize::new(attr.len() as u32),
+        };
+
+        unsafe { concat_caller(&call) }.unwrap();
+        assert_eq!(
+            y,
+            [
+                1.0, 2.0, 10.0, 11.0, 12.0, 13.0, 3.0, 4.0, 20.0, 21.0, 22.0, 23.0
+            ]
+        );
     }
 
     /// Cast 应覆盖 F16/F32/I32 常用组合。
