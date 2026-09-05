@@ -12,6 +12,7 @@ use k3_ai_uabi::{
     AiDtype, AiTargetHint, CastAttr, ConcatAttr, CopyAttr, ExpandAttr, GatherAttr,
     GatherElementsAttr, GetRowsAttr, MAX_DIM, Resize2dAttr, SetRowsAttr, TileAttr, TransposeAttr,
 };
+use log::warn;
 
 /// Concat 调用入口。
 ///
@@ -734,6 +735,7 @@ pub(crate) fn read_logical_bytes(
             .ok_or(BackendErr::InvalidTensor)
             .map(<[u8]>::to_vec);
     }
+    warn!("Use cpu slow path,one by one element");
     let mut offsets = vec![0_u64; meta.element_count];
     for (linear, offset) in offsets.iter_mut().enumerate() {
         *offset = (meta.offset_for_linear(linear)? * meta.element_size) as u64;
