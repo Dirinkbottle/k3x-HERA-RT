@@ -8,14 +8,40 @@
 #![deny(clippy::missing_docs_in_private_items)]
 #![deny(nonstandard_style)]
 
+use alloc::boxed::Box;
+
 extern crate alloc;
 
 pub mod kd_kring;
 pub mod scheduler;
 
+/// 调度器所需的内核等待队列抽象。
+pub trait K3SchedulerWaitQueue: Send + Sync {
+    /// 阻塞当前 worker，直到被通知。
+    fn wait(&self);
+
+    /// 在 `condition` 为 false 时阻塞，直到通知后重新检查条件。
+    ///
+    /// 条件检查与进入等待必须由宿主等待队列原子地协调，避免生产者入队后
+    /// worker 在等待前错过唤醒。
+    fn wait_until(&self, condition: &dyn Fn() -> bool);
+
+    /// 唤醒一个等待中的 worker。
+    fn notify_one(&self);
+
+    /// 唤醒所有等待中的 worker。
+    fn notify_all(&self);
+}
+
+/// 调度器持有的内核等待队列。
+pub type K3WaitQueue = Box<dyn K3SchedulerWaitQueue>;
+
 /// 调度器需要的操作系统接口。
 #[allow(clippy::result_unit_err)]
 pub trait K3SchedulerOps: Send + Sync {
+    /// 创建一个供单个 scheduler worker 使用的等待队列。
+    fn new_wait_queue(&self) -> K3WaitQueue;
+
     /// 返回当前调用路径实际运行的 CPU core id。
     ///
     /// 调度器用这个 id 选择 per-core queue，避免在一个 core 上提交却写入另一个
@@ -54,6 +80,3 @@ pub trait K3SchedulerOps: Send + Sync {
     /// 宿主实现必须尽力保证 `f(arg)` 在 `core_id` 对应的 core 上执行。
     fn spawn_thread_on_core(&self, core_id: u32, f: fn(usize), arg: usize);
 }
-
-/// 调度器操作系统接口 (`K3SchedulerOps`) 的具体宿主实现占位类型。
-pub struct Caller {}

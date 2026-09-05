@@ -4,24 +4,30 @@
 //! 不会跨 core 写入另一个 worker 的无锁环形队列，避免真板子上缺少跨核数据同步时
 //! 出现消费者读不到或读到旧数据的问题。
 
-use crate::{K3SchedulerOps, kd_kring::TaskLink};
+use crate::{K3SchedulerOps, K3WaitQueue, kd_kring::TaskLink};
 use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
-use k3_ai_uabi::AiCompletion;
 use k3_ai_uabi::{UserToken, error::SchedulerErr};
-use k3_kernel_backend::k3_run_kernel;
-use log::{error, warn};
-use ov_channels::{Message, Sender};
+use log::warn;
+use ov_channels::Sender;
+
+#[path = "woker.rs"]
+mod woker;
+
+use woker::worker;
 
 /// 单个 scheduler ready queue 能容纳的最大任务数。
 pub const SCHEDULER_QUEUE_CAPACITY: usize = 64;
 
 /// 当前支持缓存的最大 CPU core id 数量。
 const MAX_SCHEDULER_CORES: usize = 64;
+
+/// 绑定到指定 CPU core 的常驻 worker 入口。
+type WorkerEntry = fn(usize);
 
 /// scheduler 尚未初始化。
 const SCHEDULER_UNINIT: u8 = 0;
@@ -206,22 +212,28 @@ pub struct AINodeUnit {
 pub struct GraphScheduler {
     /// 该 scheduler 绑定的实际 CPU core id。
     core_id: u32,
+    /// 启动该 core 常驻 worker 时传给宿主的函数入口。
+    worker_entry: WorkerEntry,
+    /// worker 后续阻塞等待任务时使用的内核等待队列。
+    wait_queue: K3WaitQueue,
     /// 无锁 ready queue。
     ready_queue: PerCoreTaskQueue,
 }
 
 impl GraphScheduler {
-    /// 创建一个绑定 core 0 的 scheduler。
-    pub fn new() -> Self {
-        Self::new_with_core(0)
-    }
-
-    /// 使用指定实际 core 构造 scheduler。
-    fn new_with_core(core_id: u32) -> Self {
+    /// 使用指定实际 core、worker 入口和等待队列构造 scheduler。
+    fn new_with_core(core_id: u32, wait_queue: K3WaitQueue) -> Self {
         Self {
             core_id,
+            worker_entry: worker,
+            wait_queue,
             ready_queue: PerCoreTaskQueue::new(core_id),
         }
+    }
+
+    /// 返回宿主启动该 scheduler worker 所需的函数入口。
+    fn worker_entry(&self) -> WorkerEntry {
+        self.worker_entry
     }
 
     /// 返回 scheduler 绑定的实际 CPU core id。
@@ -314,12 +326,6 @@ impl GraphScheduler {
     }
 }
 
-impl Default for GraphScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// 单个实际 CPU core 对应的 scheduler slot。
 struct SchedulerSlot {
     /// slot 内 scheduler 的初始化状态。
@@ -392,20 +398,23 @@ fn scheduler_after_ready(core_id: u32) -> Result<&'static GraphScheduler, Schedu
 }
 
 /// 初始化指定 core 的 scheduler，或等待并发初始化者完成。
-fn ensure_scheduler(
+fn get_or_init_scheduler(
     caller: &dyn K3SchedulerOps,
     core_id: u32,
 ) -> Result<&'static GraphScheduler, SchedulerErr> {
     let slot = scheduler_slot(core_id)?;
     if try_claim_scheduler_initialization(&slot.init_state) {
-        let scheduler = GraphScheduler::new_with_core(core_id);
+        let scheduler = GraphScheduler::new_with_core(core_id, caller.new_wait_queue());
+        let worker_entry = scheduler.worker_entry();
 
         // SAFETY: 初始化状态 CAS 保证当前线程是唯一 writer，READY 发布前没有读者访问。
         unsafe {
             *slot.scheduler.get() = Some(scheduler);
         }
+        // READY 的 release store 发布 scheduler、worker entry 和 wait queue；worker 在
+        // 自己绑定的 core 上经 scheduler_after_ready 的 acquire load 才会开始访问它们。
         slot.init_state.store(SCHEDULER_READY, Ordering::Release);
-        caller.spawn_thread_on_core(core_id, worker, core_id as usize);
+        caller.spawn_thread_on_core(core_id, worker_entry, core_id as usize);
         warn!(
             "scheduler initialized: scheduler={:#x}, core_id={}",
             slot.scheduler.get() as usize,
@@ -437,7 +446,7 @@ pub fn run_graph(
         slot.worker_core_id.load(Ordering::Acquire)
     );
 
-    let scheduler = ensure_scheduler(caller.as_ref(), submit_core_id)?;
+    let scheduler = get_or_init_scheduler(caller.as_ref(), submit_core_id)?;
     let unit = AINodeUnit {
         user_token,
         caller,
@@ -450,6 +459,9 @@ pub fn run_graph(
         scheduler as *const _ as usize, submit_core_id, user_token
     );
     scheduler.push_task_for_core(submit_core_id, unit)?;
+    // 有新任务了唤醒worker
+    scheduler.wait_queue.notify_one();
+
     warn!(
         "scheduler run_graph push done: scheduler={:#x}, core_id={}, token={}, \
          queue_len_approx={}",
@@ -459,236 +471,6 @@ pub fn run_graph(
         scheduler.queue_len_approx()
     );
     Ok(())
-}
-
-
-
-/// 释放一张 graph 在 submit 阶段为 tensor 创建的所有 kernel alias。
-///
-/// 这必须在 worker 停止访问 tensor 后执行。失败时继续释放剩余映射并只记录日志，
-/// 因为 caller 仍应收到该 graph 的 completion，不能让一个清理失败卡死 worker。
-fn release_tensor_mappings(caller: &dyn K3SchedulerOps, tasklink: &TaskLink, token: UserToken) {
-    for node in tasklink.iter() {
-        let total_count = match node.desc.input_count.checked_total(node.desc.output_count) {
-            Ok(total_count) if total_count <= node.desc.tensors.len() => total_count,
-            Ok(total_count) => {
-                error!(
-                    "worker mapping cleanup rejected oversized tensor count: token={}, node_id={}, \
-                     total={}, capacity={}",
-                    token,
-                    node.node_id,
-                    total_count,
-                    node.desc.tensors.len()
-                );
-                continue;
-            }
-            Err(error) => {
-                error!(
-                    "worker mapping cleanup rejected invalid tensor count: token={}, node_id={}, \
-                     error={:?}",
-                    token, node.node_id, error
-                );
-                continue;
-            }
-        };
-
-        for tensor in &node.desc.tensors[..total_count] {
-            let kernel_va = tensor.kernel_va.get();
-            if kernel_va == 0 {
-                continue;
-            }
-            let size_bytes = match tensor.size_bytes.try_as_usize() {
-                Ok(size_bytes) if size_bytes != 0 => size_bytes,
-                Ok(_) | Err(_) => {
-                    error!(
-                        "worker mapping cleanup rejected invalid tensor size: token={}, node_id={}, \
-                         kernel_va={:#x}, size={:#x}",
-                        token,
-                        node.node_id,
-                        kernel_va,
-                        tensor.size_bytes.get()
-                    );
-                    continue;
-                }
-            };
-
-            // SAFETY: `kernel_va` and `size_bytes` came from this graph's prior
-            // successful `map_user_to_kernel` call. No backend work remains.
-            if unsafe { caller.unmap_user(kernel_va, size_bytes) }.is_err() {
-                error!(
-                    "worker mapping cleanup failed: token={}, node_id={}, kernel_va={:#x}, \
-                     size={:#x}",
-                    token, node.node_id, kernel_va, size_bytes
-                );
-            }
-        }
-    }
-}
-
-/// 常驻 graph worker；`arg` 是该 worker 绑定的实际 CPU core id。
-pub fn worker(arg: usize) {
-    let expected_core_id = match u32::try_from(arg) {
-        Ok(core_id) => core_id,
-        Err(_) => {
-            error!("scheduler worker received oversized core id: arg={}", arg);
-            return;
-        }
-    };
-    let slot = match scheduler_slot(expected_core_id) {
-        Ok(slot) => slot,
-        Err(err) => {
-            error!(
-                "scheduler worker received invalid core id: core_id={}, err={:?}",
-                expected_core_id, err
-            );
-            return;
-        }
-    };
-    slot.worker_core_id
-        .store(expected_core_id, Ordering::Release);
-    warn!("worker start: core_id={}, arg={}", expected_core_id, arg);
-
-    warn!(
-        "worker waiting for scheduler ready: core_id={}, init_state={}",
-        expected_core_id,
-        slot.init_state.load(Ordering::Acquire)
-    );
-    let scheduler = match scheduler_after_ready(expected_core_id) {
-        Ok(scheduler) => {
-            warn!(
-                "worker got scheduler: core_id={}, scheduler={:#x}, queue_len={}",
-                expected_core_id,
-                scheduler as *const _ as usize,
-                scheduler.queue_len_approx()
-            );
-            scheduler
-        }
-        Err(err) => {
-            error!(
-                "scheduler worker started before scheduler ready: core_id={}, err={:?}",
-                expected_core_id, err
-            );
-            return;
-        }
-    };
-
-    if expected_core_id != scheduler.core_id() {
-        error!(
-            "scheduler worker core mismatch: scheduler_core={}, worker_core={}",
-            scheduler.core_id(),
-            expected_core_id
-        );
-        return;
-    }
-
-    warn!(
-        "worker entering main loop: core_id={}, scheduler={:#x}",
-        expected_core_id, scheduler as *const _ as usize
-    );
-
-    let mut idle_spins = 0_u32;
-    let mut loop_iters: u64 = 0;
-    loop {
-        loop_iters = loop_iters.wrapping_add(1);
-
-
-        if let Some(mut unit) = scheduler.take_task_for_core(expected_core_id) {
-
-            slot.worker_busy.store(true, Ordering::Release);
-            slot.worker_token
-                .store(unit.user_token.get(), Ordering::Release);
-
-            let mut success = true;
-            let mut first_failed_node_id: u32 = u32::MAX;
-            let mut first_failed_node_err: u8 = 0;
-            let mut first_failed_node_op: u8 = 0;
-            for node in unit.tasklink.iter_mut() {
-                warn!(
-                    "worker run node begin: token={}, node_id={}, op={:?}",
-                    unit.user_token, node.node_id, node.desc.op
-                );
-                let ret = unsafe { k3_run_kernel(node) };
-                if ret != 0 {
-                    error!(
-                        "k3_run_kernel failed: node_id={}, op={:?}, ret={}, error_flag={}",
-                        node.node_id, node.desc.op, ret, node.state.error_flag
-                    );
-                    if first_failed_node_id == u32::MAX {
-                        first_failed_node_id = node.node_id.get();
-                        first_failed_node_err = node.state.error_flag;
-                        first_failed_node_op = node.desc.op.0;
-                    }
-                    success = false;
-                    break;
-                }
-            }
-
-            warn!(
-                "worker all nodes done: token={}, success={}",
-                unit.user_token, success
-            );
-
-            // k3_run_kernel 已经不再引用 graph 的 tensor。先撤销本次提交创建的
-            // kernel alias，完成消息发出后用户即可安全复用或释放原 tensor buffer。
-            release_tensor_mappings(unit.caller.as_ref(), &unit.tasklink, unit.user_token);
-
-            warn!(
-                "worker completion send begin: token={}, success={}",
-                unit.user_token, success
-            );
-            let completion = AiCompletion {
-                user_token: unit.user_token.get(),
-                failed_node_id: first_failed_node_id,
-                status: if success {
-                    0
-                } else {
-                    SchedulerErr::ExecutionFailed as u8
-                },
-                failed_node_err: first_failed_node_err,
-                failed_node_op: first_failed_node_op,
-                reserved: [0; 5],
-            };
-            let completion_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &completion as *const AiCompletion as *const u8,
-                    core::mem::size_of::<AiCompletion>(),
-                )
-            };
-            if unit
-                .complete_sender
-                .try_send(&Message::data(completion_bytes))
-                .is_ok()
-            {
-                warn!(
-                    "worker completion send ok: token={}, success={}",
-                    unit.user_token, success
-                );
-            } else {
-                error!("Can't notificate caller! token={}", unit.user_token);
-            }
-
-            slot.worker_token.store(0, Ordering::Release);
-            slot.worker_busy.store(false, Ordering::Release);
-            warn!(
-                "worker task end: token={}, queue_len={}",
-                unit.user_token,
-                scheduler.queue_len_approx()
-            );
-            idle_spins = 0;
-        } else {
-            idle_spins = idle_spins.wrapping_add(1);
-            if idle_spins.is_multiple_of(80_000_000) {
-                warn!(
-                    "worker idle: core_id={}, idle_spins={}, loop_iter={}, queue_len={}",
-                    expected_core_id,
-                    idle_spins,
-                    loop_iters,
-                    scheduler.queue_len_approx()
-                );
-            }
-            core::hint::spin_loop();
-        }
-    }
 }
 
 /// 无锁 ready queue 的单元测试。
@@ -706,11 +488,37 @@ mod tests {
     static TEST_CHANNELS: SharedMemory<2> = SharedMemory::new();
     /// 记录 cleanup 请求数，验证每个有效 tensor alias 都会被释放。
     static TEST_UNMAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    /// 记录 wait queue 工厂调用次数。
+    static TEST_WAIT_QUEUE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    /// 记录 scheduler 初始化时请求的 worker core。
+    static TEST_SPAWN_CORE: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// 记录 scheduler 初始化时传给宿主的 worker entry。
+    static TEST_SPAWN_ENTRY: AtomicUsize = AtomicUsize::new(0);
 
     /// 不接触真实地址空间的 scheduler 宿主。
     struct TestCaller;
 
+    /// 不阻塞测试线程的等待队列实现。
+    struct TestWaitQueue;
+
+    impl crate::K3SchedulerWaitQueue for TestWaitQueue {
+        fn wait(&self) {}
+
+        fn wait_until(&self, condition: &dyn Fn() -> bool) {
+            let _ = condition();
+        }
+
+        fn notify_one(&self) {}
+
+        fn notify_all(&self) {}
+    }
+
     impl K3SchedulerOps for TestCaller {
+        fn new_wait_queue(&self) -> crate::K3WaitQueue {
+            TEST_WAIT_QUEUE_COUNT.fetch_add(1, Ordering::Relaxed);
+            Box::new(TestWaitQueue)
+        }
+
         fn current_core_id(&self) -> u32 {
             0
         }
@@ -732,7 +540,10 @@ mod tests {
             Ok(())
         }
 
-        fn spawn_thread_on_core(&self, _core_id: u32, _f: fn(usize), _arg: usize) {}
+        fn spawn_thread_on_core(&self, core_id: u32, worker_entry: fn(usize), _arg: usize) {
+            TEST_SPAWN_CORE.store(core_id as usize, Ordering::Release);
+            TEST_SPAWN_ENTRY.store(worker_entry as usize, Ordering::Release);
+        }
     }
 
     /// 构造不含节点的任务，队列测试只观察 token 和所有权移动。
@@ -782,7 +593,7 @@ mod tests {
         };
         let before = TEST_UNMAP_COUNT.load(Ordering::Relaxed);
 
-        release_tensor_mappings(&TestCaller, &tasklink, UserToken::new(1));
+        woker::release_tensor_mappings(&TestCaller, &tasklink, UserToken::new(1));
 
         assert_eq!(TEST_UNMAP_COUNT.load(Ordering::Relaxed), before + 2);
     }
@@ -972,5 +783,32 @@ mod tests {
 
         state.store(SCHEDULER_READY, Ordering::Release);
         assert!(!try_claim_scheduler_initialization(&state));
+    }
+
+    /// scheduler 构造时必须同时绑定 worker entry 和等待队列。
+    #[test]
+    fn scheduler_constructor_binds_worker_and_wait_queue() {
+        let scheduler = GraphScheduler::new_with_core(3, Box::new(TestWaitQueue));
+
+        assert_ne!(scheduler.worker_entry() as usize, 0);
+        scheduler.wait_queue.notify_all();
+    }
+
+    /// 唯一初始化者应发布 scheduler 后，用其绑定的 worker entry 请求宿主启动。
+    #[test]
+    fn scheduler_initialization_spawns_bound_worker() {
+        let core_id = (MAX_SCHEDULER_CORES - 1) as u32;
+        TEST_WAIT_QUEUE_COUNT.store(0, Ordering::Relaxed);
+        TEST_SPAWN_CORE.store(usize::MAX, Ordering::Relaxed);
+        TEST_SPAWN_ENTRY.store(0, Ordering::Relaxed);
+
+        let scheduler = get_or_init_scheduler(&TestCaller, core_id).unwrap();
+
+        assert_eq!(TEST_WAIT_QUEUE_COUNT.load(Ordering::Acquire), 1);
+        assert_eq!(TEST_SPAWN_CORE.load(Ordering::Acquire), core_id as usize);
+        assert_eq!(
+            TEST_SPAWN_ENTRY.load(Ordering::Acquire),
+            scheduler.worker_entry() as usize
+        );
     }
 }
