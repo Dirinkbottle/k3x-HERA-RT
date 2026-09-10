@@ -310,10 +310,10 @@ fn conv2d_f16(
     target: AiTargetHint,
 ) -> Result<(), BackendErr> {
     match target {
-        AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => {
+        AiTargetHint::PREFER_CPU => {
             conv2d_f16_cpu(g, input, weight, bias, output)
         }
-        AiTargetHint::PREFER_A100 => {
+        AiTargetHint::AUTO | AiTargetHint::PREFER_A100 => {
             #[cfg(feature = "a100-fp16-ime")]
             {
                 conv2d_f16_ime(g, input, weight, bias, output)

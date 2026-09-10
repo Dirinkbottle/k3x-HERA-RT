@@ -211,9 +211,9 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
                 attr,
             };
             match target {
-                AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => cpu_f16_f32(parameter),
+                AiTargetHint::PREFER_CPU => cpu_f16_f32(parameter),
                 AiTargetHint::PREFER_X100 => Err(BackendErr::UnsupportedDtype),
-                AiTargetHint::PREFER_A100 => {
+                AiTargetHint::AUTO | AiTargetHint::PREFER_A100 => {
                     #[cfg(feature = "a100-fp16-ime")]
                     {
                         ime_f16_f32_matmul(parameter)
@@ -709,7 +709,7 @@ fn vfwmadot_tile(
         any(target_arch = "riscv32", target_arch = "riscv64")
     )))]
     {
-        vfwmadot_tile_sw(lhs_tile, rhs_tile, output);
+        panic!("unsupport vfwmadot_tile backend!");
     }
 }
 
