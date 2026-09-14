@@ -164,8 +164,8 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
             };
 
             match target {
-                AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => cpu(parameter),
-                AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => {
+                AiTargetHint::PREFER_CPU => cpu(parameter),
+                AiTargetHint::AUTO | AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => {
                     error!("matmul_caller: IME f32 matmul is not implemented yet");
                     Err(BackendErr::UnsupportedDtype)
                 }
@@ -265,9 +265,9 @@ pub(crate) unsafe fn matmul_caller(call: *const BackendCall) -> Result<(), Backe
             };
 
             match target {
-                AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => cpu_int8_i32(parameter),
+                AiTargetHint::PREFER_CPU => cpu_int8_i32(parameter),
+                AiTargetHint::AUTO | AiTargetHint::PREFER_A100 => a100(parameter),
                 AiTargetHint::PREFER_X100 => x100(parameter),
-                AiTargetHint::PREFER_A100 => a100(parameter),
                 _ => unreachable!("CallContext rejects unknown targets"),
             }
         }
@@ -1313,8 +1313,8 @@ mod tests {
         out
     }
 
-    /// 用固定 2×3·3×2 的 f32 数据跑一次完整 `matmul_caller`，返回输出。
-    fn run_f32_backend_call(target: AiTargetHint) -> [f32; 4] {
+    /// 用固定 2×3·3×2 的 f32 数据跑一次完整 `matmul_caller`。
+    fn run_f32_backend_call(target: AiTargetHint) -> Result<[f32; 4], BackendErr> {
         let attr = row_major_attr(2, 2, 3, AiDtype::F32);
         let lhs = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let rhs = [7.0_f32, 8.0, 9.0, 10.0, 11.0, 12.0];
@@ -1337,17 +1337,19 @@ mod tests {
             attr_size: AttrByteSize::new(attr.len() as u32),
         };
 
-        unsafe { matmul_caller(&call) }.unwrap();
-        out
+        unsafe { matmul_caller(&call) }.map(|()| out)
     }
 
-    /// AUTO 与 PREFER_CPU 目标的 f32 matmul 应得到相同的已知结果。
+    /// AUTO 应按 A100 路由；A100 f32 IME 尚未实现时不得回退到 CPU。
     #[test]
-    fn backend_call_cpu_and_auto_f32_matmul() {
+    fn backend_call_auto_f32_matmul_uses_a100_route() {
         let expected = [58.0_f32, 64.0, 139.0, 154.0];
 
-        assert_eq!(run_f32_backend_call(AiTargetHint::AUTO), expected);
-        assert_eq!(run_f32_backend_call(AiTargetHint::PREFER_CPU), expected);
+        assert!(matches!(
+            run_f32_backend_call(AiTargetHint::AUTO),
+            Err(BackendErr::UnsupportedDtype)
+        ));
+        assert_eq!(run_f32_backend_call(AiTargetHint::PREFER_CPU), Ok(expected));
     }
 
     /// x100 分块在 M/N/K 均不整除 tile 尺寸时应产生与参考实现相同的结果。

@@ -1,0 +1,12 @@
+# Rust compilation output for the integration test and local crates.
+/target/
+
+# The ONNX Runtime checkout is prepared locally and includes an embedded Git
+# repository and CMake build products. Follow README.md to obtain and build it.
+/onnxruntime/
+
+# Cargo registry extraction metadata is not part of the local ort-sys patch.
+/third_party/ort-sys/.cargo-ok
+/third_party/ort-sys/.cargo_vcs_info.json
+/third_party/ort-sys/Cargo.lock
+/third_party/ort-sys/Cargo.toml.orig

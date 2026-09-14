@@ -85,8 +85,10 @@ fn dispatch_f32(
         return Err(BackendErr::InvalidTensor);
     }
     match target {
-        AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => cpu_f32(kind, attr, input, output),
-        AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => rvv_f32(kind, attr, input, output),
+        AiTargetHint::PREFER_CPU => cpu_f32(kind, attr, input, output),
+        AiTargetHint::AUTO | AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => {
+            rvv_f32(kind, attr, input, output)
+        }
         _ => unreachable!("CallContext rejects unknown targets"),
     }
 }
@@ -108,8 +110,10 @@ fn dispatch_f16(
         return Err(BackendErr::InvalidTensor);
     }
     match target {
-        AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => cpu_f16(kind, attr, input, output),
-        AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => rvv_f16(kind, attr, input, output),
+        AiTargetHint::PREFER_CPU => cpu_f16(kind, attr, input, output),
+        AiTargetHint::AUTO | AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => {
+            rvv_f16(kind, attr, input, output)
+        }
         _ => unreachable!("CallContext rejects unknown targets"),
     }
 }

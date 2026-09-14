@@ -8,14 +8,17 @@ ABI 校验、attr 读取、target 校验、tensor typed slice 与 shape/stride �
 
 | 标记 | 含义 |
 | --- | --- |
-| CPU | 软件参考核，`AUTO`/`PREFER_CPU` 默认路径 |
-| RVV | `PREFER_X100`/`PREFER_A100` 下使用真实 RISC-V VLA RVV，host 单测使用同语义软件镜像 |
+| CPU | 软件参考核，仅 `PREFER_CPU` 使用 |
+| RVV | `AUTO`/`PREFER_X100`/`PREFER_A100` 下使用真实 RISC-V VLA RVV，host 单测使用同语义软件镜像 |
 | IME int8 | X100/A100 int8 `vmadot` tile 路径 |
 | A100 FP16 IME | feature `a100-fp16-ime` 下的 A100 `smt.vfwmadot` 路径，默认关闭 |
 | Frontend lowering | metadata/view/init 类 op 在 frontend 降低为 tensor view 或常量，不进入 backend kernel |
 
 `a100-fp16-ime` 默认关闭。关闭时，FP16 MatMul/Conv2d 在 `PREFER_A100` 下明确返回
 `UnsupportedOp`，避免在 MCPM.BF16 控制尚未接入前静默回退 CPU。
+
+`AUTO` 在 backend 公共调用层统一归一化为 `PREFER_A100`；因此 AUTO 不会再静默回退
+到 CPU。显式需要 CPU 时请使用 `PREFER_CPU`。
 
 ## YOLO26x ONNX 清单
 

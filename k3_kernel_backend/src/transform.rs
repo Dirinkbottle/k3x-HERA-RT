@@ -806,7 +806,7 @@ fn copy_for_target(
 pub(crate) fn vector_target(target: AiTargetHint) -> bool {
     matches!(
         target,
-        AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100
+        AiTargetHint::AUTO | AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100
     )
 }
 

@@ -253,19 +253,23 @@ fn validate_request(req: &K3OrtRunNode) -> Result<usize, K3OrtStatus> {
     Ok(total)
 }
 
-/// Validate the v1 dense FP32 tensor contract and calculate its byte size safely.
+/// Validate the v1 dense F32/F16 tensor contract and calculate its byte size safely.
 fn validate_tensor(raw: &K3OrtTensor) -> Result<(), K3OrtStatus> {
     let rank = raw.ndim as usize;
+    let element_size = match raw.dtype {
+        dtype if dtype == crate::fronted::AiDtype::F32.0 => core::mem::size_of::<f32>() as u64,
+        dtype if dtype == crate::fronted::AiDtype::F16.0 => core::mem::size_of::<u16>() as u64,
+        _ => return Err(K3OrtStatus::InvalidTensor),
+    };
     if rank > MAX_DIM
         || raw.data.is_null()
-        || raw.dtype != crate::fronted::AiDtype::F32.0
         || !matches!(raw.format, 0 | 1)
         || raw.layout != AiTensorLayout::DENSE.0
     {
         return Err(K3OrtStatus::InvalidTensor);
     }
 
-    let mut expected_size = core::mem::size_of::<f32>() as u64;
+    let mut expected_size = element_size;
     for &dim in &raw.shape[..rank] {
         if dim == 0 {
             return Err(K3OrtStatus::InvalidTensor);
@@ -278,7 +282,7 @@ fn validate_tensor(raw: &K3OrtTensor) -> Result<(), K3OrtStatus> {
         return Err(K3OrtStatus::InvalidTensor);
     }
 
-    let mut expected_stride = core::mem::size_of::<f32>() as u64;
+    let mut expected_stride = element_size;
     for dim_idx in (0..rank).rev() {
         if raw.stride_bytes[dim_idx] != expected_stride {
             return Err(K3OrtStatus::InvalidTensor);
@@ -517,5 +521,24 @@ mod tests {
         req.tensors[1] = dense_tensor(&mut output, &[2]);
         req.tensors[0].layout = AiTensorLayout::STRIDED.0;
         assert_eq!(run_node(&req), Err(K3OrtStatus::InvalidTensor));
+    }
+
+    #[test]
+    fn accepts_dense_f16_tensor_metadata() {
+        let mut storage = [0_u16; 2];
+        let tensor = K3OrtTensor {
+            data: storage.as_mut_ptr().cast(),
+            size_bytes: core::mem::size_of_val(&storage) as u64,
+            dtype: AiDtype::F16.0,
+            format: AiTensorFormat::ANY.0,
+            layout: AiTensorLayout::DENSE.0,
+            ndim: 1,
+            flags: 0,
+            reserved0: [0; 3],
+            shape: [2, 0, 0, 0, 0, 0, 0, 0],
+            stride_bytes: [2, 0, 0, 0, 0, 0, 0, 0],
+        };
+
+        assert_eq!(validate_tensor(&tensor), Ok(()));
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "ort_learn"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ort = "=2.0.0-rc.13"
+ndarray = "0.17"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[patch.crates-io]
+ort-sys = { path = "third_party/ort-sys" }

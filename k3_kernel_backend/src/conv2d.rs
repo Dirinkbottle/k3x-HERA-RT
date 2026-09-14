@@ -310,9 +310,7 @@ fn conv2d_f16(
     target: AiTargetHint,
 ) -> Result<(), BackendErr> {
     match target {
-        AiTargetHint::PREFER_CPU => {
-            conv2d_f16_cpu(g, input, weight, bias, output)
-        }
+        AiTargetHint::PREFER_CPU => conv2d_f16_cpu(g, input, weight, bias, output),
         AiTargetHint::AUTO | AiTargetHint::PREFER_A100 => {
             #[cfg(feature = "a100-fp16-ime")]
             {
@@ -468,10 +466,13 @@ fn conv2d_int8(
         bias.map(<[i32]>::len),
     )?;
     match target {
-        AiTargetHint::AUTO | AiTargetHint::PREFER_CPU => {
+        AiTargetHint::PREFER_CPU => {
             conv2d_int8_cpu(g, input, weight, bias, output, in_dtype, w_dtype)
         }
-        AiTargetHint::PREFER_X100 | AiTargetHint::PREFER_A100 => {
+        AiTargetHint::AUTO | AiTargetHint::PREFER_A100 => {
+            conv2d_int8_ime(g, input, weight, bias, output, in_dtype, w_dtype)
+        }
+        AiTargetHint::PREFER_X100 => {
             conv2d_int8_ime(g, input, weight, bias, output, in_dtype, w_dtype)
         }
         _ => unreachable!("CallContext rejects unknown targets"),

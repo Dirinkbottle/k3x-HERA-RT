@@ -497,11 +497,16 @@ impl<'a> CallContext<'a> {
         }
 
         let call = unsafe { &*call };
-        let target = AiTargetHint(call.target);
-        if !target.is_known() {
+        let requested_target = AiTargetHint(call.target);
+        if !requested_target.is_known() {
             error!("CallContext: unknown target {}", call.target);
             return Err(BackendErr::UnsupportedOp);
         }
+        // AUTO 的默认策略固定为 A100，避免算子各自把 AUTO 静默解释成 CPU。
+        let target = match requested_target {
+            AiTargetHint::AUTO => AiTargetHint::PREFER_A100,
+            target => target,
+        };
 
         let input_count = call
             .input_count
@@ -825,6 +830,24 @@ mod tests {
             unsafe { CallContext::from_call(&call) },
             Err(BackendErr::UnsupportedOp)
         ));
+    }
+
+    /// AUTO 目标应在公共调用层统一归一化为 A100。
+    #[test]
+    fn call_context_routes_auto_to_a100() {
+        let call = BackendCall {
+            op: KernelOp::MAT_MUL,
+            target: AiTargetHint::AUTO.0,
+            inputs: core::ptr::null(),
+            input_count: TensorCount::new(0),
+            outputs: core::ptr::null_mut(),
+            output_count: TensorCount::new(0),
+            attr: core::ptr::null(),
+            attr_size: AttrByteSize::new(0),
+        };
+
+        let ctx = unsafe { CallContext::from_call(&call) }.unwrap();
+        assert_eq!(ctx.target, AiTargetHint::PREFER_A100);
     }
 
     /// byte_len 不能被元素大小整除时应返回 `InvalidTensor`。

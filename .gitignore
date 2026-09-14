@@ -3,3 +3,8 @@
 AGENTS.md
 CLAUDE.md
 target/
+
+# Local development checkouts and virtual environments.
+/yolov5/
+/tool/
+/py_venv/

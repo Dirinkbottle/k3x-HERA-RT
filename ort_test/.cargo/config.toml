@@ -1,0 +1,20 @@
+[build]
+target = "riscv64gc-unknown-linux-musl"
+
+[target.riscv64gc-unknown-linux-musl]
+# Resolve the cross linker from PATH so each developer can choose a toolchain location.
+linker = "riscv64-unknown-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[alias]
+b-host = "build --target x86_64-unknown-linux-gnu"
+r-host = "run --target x86_64-unknown-linux-gnu"
+b-riscv = "build --target riscv64gc-unknown-linux-musl"
+r-riscv = "run --target riscv64gc-unknown-linux-musl"
+
+[env]
+# This is intentionally not ORT_LIB_PATH.  Cargo has no target-scoped [env]
+# table, so a global ORT_LIB_PATH would incorrectly make host builds link to
+# RISC-V archives.  The local ort-sys patch consumes this only for the K3
+# RISC-V/musl target.
+K3_ORT_LIB_PATH = { value = "onnxruntime/build/riscv64gc-musl/Release", force = true }
