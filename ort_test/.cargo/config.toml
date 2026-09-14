@@ -17,4 +17,5 @@ r-riscv = "run --target riscv64gc-unknown-linux-musl"
 # table, so a global ORT_LIB_PATH would incorrectly make host builds link to
 # RISC-V archives.  The local ort-sys patch consumes this only for the K3
 # RISC-V/musl target.
-K3_ORT_LIB_PATH = { value = "onnxruntime/build/riscv64gc-musl/Release", force = true }
+K3_ORT_LIB_PATH = { value = "/home/inkbottle/othersrc/k3x-HERA-RT/ort_test/onnxruntime/build/riscv64gc-musl/Release", force = true }
+

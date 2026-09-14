@@ -94,7 +94,7 @@ pub unsafe extern "C" fn k3_run_kernel(node: &mut AiGraphNode) -> i32 {
     let call = BackendCall {
         op: desc.op,
         // TODO: X100 bring-up 完成后恢复使用调度器传入的 target hint。
-        target: AiTargetHint::PREFER_X100.0,
+        target: AiTargetHint::PREFER_A100.0,
         inputs: input_views.as_ptr(),
         input_count: desc.input_count,
         outputs: output_views.as_mut_ptr(),
