@@ -1,26 +1,61 @@
 //! 归约、池化与模型常用 NN 算子。
 
-use crate::BackendCall;
 use crate::call::{CallContext, TensorMeta, normalize_axis};
 use crate::rvv::{self, BinaryOp};
 use crate::transform::{
     read_float_tensor, read_indices, row_major_linear, vector_target, write_float_tensor,
     write_logical_bytes,
 };
+use crate::{BackendCall, ComputeKernel};
 use alloc::vec;
 use alloc::vec::Vec;
 use k3_ai_uabi::error::BackendErr;
 use k3_ai_uabi::{
-    AiDtype, GluAttr, MAX_DIM, Pool2dAttr, ReduceMaxAttr, RmsNormAttr, RopeAttr, SoftmaxAttr,
-    TopKAttr,
+    AiDtype, GluAttr, KernelOp, MAX_DIM, Pool2dAttr, ReduceMaxAttr, RmsNormAttr, RopeAttr,
+    SoftmaxAttr, TopKAttr,
 };
+
+/// Softmax 的静态分发标记。
+pub(crate) struct SoftmaxKernel;
+/// RMSNorm 的静态分发标记。
+pub(crate) struct RmsNormKernel;
+/// RoPE 的静态分发标记。
+pub(crate) struct RopeKernel;
+/// GLU 的静态分发标记。
+pub(crate) struct GluKernel;
+/// MaxPool 的静态分发标记。
+pub(crate) struct MaxPoolKernel;
+/// ReduceMax 的静态分发标记。
+pub(crate) struct ReduceMaxKernel;
+/// TopK 的静态分发标记。
+pub(crate) struct TopKKernel;
+
+macro_rules! impl_nn_kernel {
+    ($marker:ident, $op:expr, $entry:ident) => {
+        impl ComputeKernel for $marker {
+            const OP: KernelOp = $op;
+
+            unsafe fn call(call: *const BackendCall) -> Result<(), BackendErr> {
+                unsafe { $entry(call) }
+            }
+        }
+    };
+}
+
+impl_nn_kernel!(SoftmaxKernel, KernelOp::SOFTMAX, call_softmax);
+impl_nn_kernel!(RmsNormKernel, KernelOp::RMS_NORM, call_rms_norm);
+impl_nn_kernel!(RopeKernel, KernelOp::ROPE, call_rope);
+impl_nn_kernel!(GluKernel, KernelOp::GLU, call_glu);
+impl_nn_kernel!(MaxPoolKernel, KernelOp::MAX_POOL, call_max_pool);
+impl_nn_kernel!(ReduceMaxKernel, KernelOp::REDUCE_MAX, call_reduce_max);
+impl_nn_kernel!(TopKKernel, KernelOp::TOP_K, call_top_k);
 
 /// Softmax 调用入口。
 ///
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn softmax_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_softmax(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io_range(1..=2, 1..=1)?;
     ctx.reject_input_output_alias()?;
@@ -35,7 +70,7 @@ pub(crate) unsafe fn softmax_caller(call: *const BackendCall) -> Result<(), Back
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
     let mask = if ctx.inputs.len() == 2 {
         let meta = ctx.inputs[1].checked_meta()?;
-        if !matches!(ctx.inputs[1].dtype, AiDtype::F32 | AiDtype::F16) {
+        if ctx.inputs[1].dtype != AiDtype::F16 {
             return Err(BackendErr::UnsupportedDtype);
         }
         validate_softmax_mask(&input_meta, &meta)?;
@@ -43,7 +78,7 @@ pub(crate) unsafe fn softmax_caller(call: *const BackendCall) -> Result<(), Back
     } else {
         None
     };
-    let output = softmax_f32(
+    let output = compute_f16_softmax(
         &input,
         &input_meta,
         axis,
@@ -59,7 +94,7 @@ pub(crate) unsafe fn softmax_caller(call: *const BackendCall) -> Result<(), Back
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn rms_norm_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_rms_norm(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io_range(1..=2, 1..=1)?;
     ctx.reject_input_output_alias()?;
@@ -92,7 +127,7 @@ pub(crate) unsafe fn rms_norm_caller(call: *const BackendCall) -> Result<(), Bac
         unit_weight = vec![1.0_f32; hidden];
         unit_weight
     };
-    let output = rms_norm_f32(&input, &weight, hidden, attr.eps, ctx.target)?;
+    let output = compute_f16_rms_norm(&input, &weight, hidden, attr.eps, ctx.target)?;
     write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
 }
 
@@ -101,7 +136,7 @@ pub(crate) unsafe fn rms_norm_caller(call: *const BackendCall) -> Result<(), Bac
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn rope_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_rope(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io_range(1..=2, 1..=1)?;
     ctx.reject_input_output_alias()?;
@@ -137,7 +172,7 @@ pub(crate) unsafe fn rope_caller(call: *const BackendCall) -> Result<(), Backend
         None
     };
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
-    let output = rope_f32(
+    let output = compute_f16_rope(
         &input,
         batch,
         sequence,
@@ -156,7 +191,7 @@ pub(crate) unsafe fn rope_caller(call: *const BackendCall) -> Result<(), Backend
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn glu_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_glu(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io_range(1..=2, 1..=1)?;
     ctx.reject_input_output_alias()?;
@@ -164,12 +199,18 @@ pub(crate) unsafe fn glu_caller(call: *const BackendCall) -> Result<(), BackendE
     if attr.op != GluAttr::OP_SWIGLU || attr.flags.get() != 0 {
         return Err(BackendErr::InvalidAttr);
     }
+    if ctx.inputs[0].dtype != AiDtype::F16
+        || ctx.outputs[0].dtype != AiDtype::F16
+        || ctx
+            .inputs
+            .get(1)
+            .is_some_and(|view| view.dtype != AiDtype::F16)
+    {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
-    if !matches!(ctx.inputs[0].dtype, AiDtype::F32 | AiDtype::F16)
-        || ctx.outputs[0].dtype != ctx.inputs[0].dtype
-        || input_meta.rank != output_meta.rank
-    {
+    if input_meta.rank != output_meta.rank {
         return Err(BackendErr::InvalidTensor);
     }
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
@@ -189,7 +230,7 @@ pub(crate) unsafe fn glu_caller(call: *const BackendCall) -> Result<(), BackendE
         }
         input.clone()
     };
-    let output = swiglu_f32(&input, &rhs, &input_meta, &output_meta, attr.swapped != 0)?;
+    let output = compute_f16_glu(&input, &rhs, &input_meta, &output_meta, attr.swapped != 0)?;
     write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
 }
 
@@ -198,17 +239,19 @@ pub(crate) unsafe fn glu_caller(call: *const BackendCall) -> Result<(), BackendE
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn max_pool_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_max_pool(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io_range(1..=1, 1..=2)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<Pool2dAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     if input_meta.rank != 4
         || output_meta.rank != 4
         || ctx.inputs[0].dtype != ctx.outputs[0].dtype
-        || !matches!(ctx.inputs[0].dtype, AiDtype::F32 | AiDtype::F16)
         || input_meta.shape[0] != output_meta.shape[0]
         || input_meta.shape[1] != output_meta.shape[1]
     {
@@ -256,7 +299,8 @@ pub(crate) unsafe fn max_pool_caller(call: *const BackendCall) -> Result<(), Bac
         None
     };
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
-    let (values, indices) = max_pool_f32(&input, &input_meta, &output_meta, &attr, ctx.target)?;
+    let (values, indices) =
+        compute_f16_max_pool(&input, &input_meta, &output_meta, &attr, ctx.target)?;
     write_float_tensor(&values, &mut ctx.outputs[0], &output_meta, ctx.target)?;
     if let Some(meta) = indices_meta {
         let logical = i64_bytes(&indices);
@@ -271,16 +315,14 @@ pub(crate) unsafe fn max_pool_caller(call: *const BackendCall) -> Result<(), Bac
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn reduce_max_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_reduce_max(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<ReduceMaxAttr>()?;
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
-    if ctx.inputs[0].dtype != ctx.outputs[0].dtype
-        || !matches!(ctx.inputs[0].dtype, AiDtype::F32 | AiDtype::F16)
-    {
+    if ctx.inputs[0].dtype != ctx.outputs[0].dtype || ctx.inputs[0].dtype != AiDtype::F16 {
         return Err(BackendErr::UnsupportedDtype);
     }
     let axis_count = attr.axis_count.get() as usize;
@@ -304,7 +346,7 @@ pub(crate) unsafe fn reduce_max_caller(call: *const BackendCall) -> Result<(), B
     }
     validate_reduce_output(&input_meta, &output_meta, &reduced, &attr)?;
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
-    let output = reduce_max_f32(&input, &input_meta, &output_meta, &reduced, ctx.target)?;
+    let output = compute_f16_reduce_max(&input, &input_meta, &output_meta, &reduced, ctx.target)?;
     write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
 }
 
@@ -313,11 +355,14 @@ pub(crate) unsafe fn reduce_max_caller(call: *const BackendCall) -> Result<(), B
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn top_k_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_top_k(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 2)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<TopKAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let values_meta = ctx.outputs[0].checked_meta()?;
     let indices_meta = ctx.outputs[1].checked_meta()?;
@@ -325,7 +370,6 @@ pub(crate) unsafe fn top_k_caller(call: *const BackendCall) -> Result<(), Backen
     let k = attr.k.get() as usize;
     if k == 0
         || k > input_meta.shape[axis]
-        || ctx.inputs[0].dtype != ctx.outputs[0].dtype
         || ctx.outputs[1].dtype != AiDtype::I64
         || values_meta.shape[..values_meta.rank] != indices_meta.shape[..indices_meta.rank]
         || values_meta.rank != input_meta.rank
@@ -343,31 +387,30 @@ pub(crate) unsafe fn top_k_caller(call: *const BackendCall) -> Result<(), Backen
         }
     }
     let input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
-    let (values, indices) = top_k_f32(&input, &input_meta, axis, k, attr.largest != 0)?;
+    let (values, indices) = compute_f16_top_k(&input, &input_meta, axis, k, attr.largest != 0)?;
     write_float_tensor(&values, &mut ctx.outputs[0], &values_meta, ctx.target)?;
     let logical_indices = i64_bytes(&indices);
     let output = unsafe { ctx.outputs[1].as_mut_slice::<u8>()? };
     write_logical_bytes(&logical_indices, output, &indices_meta, ctx.target)
 }
 
-/// 校验输入输出均为相同 shape 的 F32/F16 tensor。
+/// 校验输入输出均为相同 shape 的 F16 tensor。
 fn validate_float_same_shape(
     ctx: &CallContext<'_>,
     input: &TensorMeta,
     output: &TensorMeta,
 ) -> Result<(), BackendErr> {
-    if ctx.inputs[0].dtype != ctx.outputs[0].dtype
-        || !matches!(ctx.inputs[0].dtype, AiDtype::F32 | AiDtype::F16)
-        || input.rank != output.rank
-        || input.shape[..input.rank] != output.shape[..output.rank]
-    {
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
+    if input.rank != output.rank || input.shape[..input.rank] != output.shape[..output.rank] {
         return Err(BackendErr::InvalidTensor);
     }
     Ok(())
 }
 
 /// 按 arbitrary axis 执行数值稳定 Softmax。
-fn softmax_f32(
+fn compute_f16_softmax(
     input: &[f32],
     meta: &TensorMeta,
     axis: usize,
@@ -396,13 +439,13 @@ fn softmax_f32(
                 }
             }
             let maximum = if vector_target(target) {
-                rvv::reduce_max_f32(&row)
+                rvv::f16_reduce_max_work(&row)
             } else {
                 row.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             };
             if vector_target(target) {
-                rvv::affine_f32(&row, &mut shifted, 1.0, -maximum)?;
-                rvv::exp_f32(&shifted, &mut exponentials)?;
+                rvv::f16_affine_work(&row, &mut shifted, 1.0, -maximum)?;
+                rvv::f16_exp_work(&shifted, &mut exponentials)?;
             } else {
                 for ((shifted, exponential), &value) in
                     shifted.iter_mut().zip(&mut exponentials).zip(&row)
@@ -412,12 +455,12 @@ fn softmax_f32(
                 }
             }
             let sum = if vector_target(target) {
-                rvv::reduce_sum_f32(&exponentials)
+                rvv::f16_reduce_sum_work(&exponentials)
             } else {
                 exponentials.iter().sum()
             };
             if vector_target(target) {
-                rvv::affine_f32(&exponentials, &mut shifted, 1.0 / sum, 0.0)?;
+                rvv::f16_affine_work(&exponentials, &mut shifted, 1.0 / sum, 0.0)?;
             } else {
                 for (dst, &value) in shifted.iter_mut().zip(&exponentials) {
                     *dst = value / sum;
@@ -470,7 +513,7 @@ fn broadcast_mask_linear(
 }
 
 /// SWIGLU core: `silu(lhs) * rhs`.
-fn swiglu_f32(
+fn compute_f16_glu(
     input: &[f32],
     rhs: &[f32],
     input_meta: &TensorMeta,
@@ -514,7 +557,7 @@ fn swiglu_f32(
 }
 
 /// RMSNorm F32 核心。
-fn rms_norm_f32(
+fn compute_f16_rms_norm(
     input: &[f32],
     weight: &[f32],
     hidden: usize,
@@ -529,15 +572,15 @@ fn rms_norm_f32(
         .zip(output.chunks_exact_mut(hidden))
     {
         let sum = if vector_target(target) {
-            rvv::binary_f32(BinaryOp::Mul, row, row, &mut squares)?;
-            rvv::reduce_sum_f32(&squares)
+            rvv::f16_binary_work(BinaryOp::Mul, row, row, &mut squares)?;
+            rvv::f16_reduce_sum_work(&squares)
         } else {
             row.iter().map(|value| value * value).sum()
         };
         let normalization = 1.0 / libm::sqrtf(sum / hidden as f32 + epsilon);
         if vector_target(target) {
-            rvv::binary_f32(BinaryOp::Mul, row, weight, &mut weighted)?;
-            rvv::affine_f32(&weighted, out_row, normalization, 0.0)?;
+            rvv::f16_binary_work(BinaryOp::Mul, row, weight, &mut weighted)?;
+            rvv::f16_affine_work(&weighted, out_row, normalization, 0.0)?;
         } else {
             for ((dst, &value), &scale) in out_row.iter_mut().zip(row).zip(weight) {
                 *dst = value * scale * normalization;
@@ -549,7 +592,7 @@ fn rms_norm_f32(
 
 /// RoPE F32 核心，sin/cos 系数按 position 计算，旋转乘加使用 RVV。
 #[allow(clippy::too_many_arguments)]
-fn rope_f32(
+fn compute_f16_rope(
     input: &[f32],
     batch: usize,
     sequence: usize,
@@ -615,12 +658,12 @@ fn rope_f32(
     if vector_target(target) {
         let mut a = vec![0.0_f32; pairs];
         let mut b = vec![0.0_f32; pairs];
-        rvv::binary_f32(BinaryOp::Mul, &x, &cosine, &mut a)?;
-        rvv::binary_f32(BinaryOp::Mul, &y, &sine, &mut b)?;
-        rvv::binary_f32(BinaryOp::Sub, &a, &b, &mut first)?;
-        rvv::binary_f32(BinaryOp::Mul, &x, &sine, &mut a)?;
-        rvv::binary_f32(BinaryOp::Mul, &y, &cosine, &mut b)?;
-        rvv::binary_f32(BinaryOp::Add, &a, &b, &mut second)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &x, &cosine, &mut a)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &y, &sine, &mut b)?;
+        rvv::f16_binary_work(BinaryOp::Sub, &a, &b, &mut first)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &x, &sine, &mut a)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &y, &cosine, &mut b)?;
+        rvv::f16_binary_work(BinaryOp::Add, &a, &b, &mut second)?;
     } else {
         for index in 0..pairs {
             first[index] = x[index] * cosine[index] - y[index] * sine[index];
@@ -680,7 +723,7 @@ fn pool_output_dim(
 }
 
 /// NCHW MaxPool F32 核心。
-fn max_pool_f32(
+fn compute_f16_max_pool(
     input: &[f32],
     input_meta: &TensorMeta,
     output_meta: &TensorMeta,
@@ -731,7 +774,7 @@ fn max_pool_f32(
                         continue;
                     }
                     let maximum = if vector_target(target) {
-                        rvv::reduce_max_f32(&window)
+                        rvv::f16_reduce_max_work(&window)
                     } else {
                         window.iter().copied().fold(f32::NEG_INFINITY, f32::max)
                     };
@@ -785,7 +828,7 @@ fn validate_reduce_output(
 }
 
 /// Generic ReduceMax F32 核心。
-fn reduce_max_f32(
+fn compute_f16_reduce_max(
     input: &[f32],
     input_meta: &TensorMeta,
     output_meta: &TensorMeta,
@@ -826,7 +869,7 @@ fn reduce_max_f32(
             *value = input[row_major_linear(input_meta, &input_coordinates)?];
         }
         *output_value = if vector_target(target) {
-            rvv::reduce_max_f32(&values)
+            rvv::f16_reduce_max_work(&values)
         } else {
             values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
         };
@@ -835,7 +878,7 @@ fn reduce_max_f32(
 }
 
 /// TopK CPU 核心。
-fn top_k_f32(
+fn compute_f16_top_k(
     input: &[f32],
     meta: &TensorMeta,
     axis: usize,
@@ -919,7 +962,7 @@ mod tests {
     /// Softmax 行和应接近 1。
     #[test]
     fn softmax_is_normalized() {
-        let output = softmax_f32(
+        let output = compute_f16_softmax(
             &[1.0, 2.0, 3.0, -1.0, 0.0, 1.0],
             &meta(&[2, 3]),
             1,
@@ -935,7 +978,7 @@ mod tests {
     /// RMSNorm 应匹配直接参考公式。
     #[test]
     fn rms_norm_matches_reference() {
-        let output = rms_norm_f32(
+        let output = compute_f16_rms_norm(
             &[1.0, 2.0, 3.0, 4.0],
             &[1.0, 1.0],
             2,
@@ -952,7 +995,8 @@ mod tests {
     #[test]
     fn swiglu_split_uses_axis0_halves() {
         let input = [1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
-        let output = swiglu_f32(&input, &input, &meta(&[4, 2]), &meta(&[2, 2]), false).unwrap();
+        let output =
+            compute_f16_glu(&input, &input, &meta(&[4, 2]), &meta(&[2, 2]), false).unwrap();
         let expected = [
             silu_ref(1.0) * 10.0,
             silu_ref(2.0) * 20.0,
@@ -971,7 +1015,8 @@ mod tests {
     /// TopK 平局时应优先较低索引。
     #[test]
     fn top_k_is_stable_for_ties() {
-        let (values, indices) = top_k_f32(&[3.0, 5.0, 5.0, 1.0], &meta(&[4]), 0, 2, true).unwrap();
+        let (values, indices) =
+            compute_f16_top_k(&[3.0, 5.0, 5.0, 1.0], &meta(&[4]), 0, 2, true).unwrap();
         assert_eq!(values, [5.0, 5.0]);
         assert_eq!(indices, [1, 2]);
     }
@@ -982,7 +1027,7 @@ mod tests {
         let input_meta = meta(&[2, 2, 2]);
         let output_meta = meta(&[2]);
         let reduced = [false, true, true, false, false, false, false, false];
-        let output = reduce_max_f32(
+        let output = compute_f16_reduce_max(
             &[1.0, 2.0, 3.0, 4.0, 8.0, 7.0, 6.0, 5.0],
             &input_meta,
             &output_meta,

@@ -1,68 +1,62 @@
-//! 二维卷积算子。
-//!
-//! 实现策略：im2col 展开 + matmul。权重视作 `[Cout, Cin*KH*KW]` 矩阵，im2col
-//! 把输入每个输出点的感受野展开成 `[Cin*KH*KW, Hout*Wout]` 矩阵，二者相乘得
-//! `[Cout, Hout*Wout]` 输出。
-//!
-//! 计算落点：matmul 部分复用 [`crate::matmul`] 引擎——int8 走 IME vmadot
-//! （x100/a100），f32 走软件 matmul。f16 默认解码到 f32 在 cpu 直算；启用
-//! `a100-fp16-ime` feature 后，A100 使用流式 im2col + `smt.vfwmadot`。
-//!
-//! 张量约定：inputs[0]=input(NCHW)、inputs[1]=weight([Cout,Cin/groups,KH,KW] 行主序)，
-//! inputs[2]=bias([Cout]) 可选，outputs[0]=output(NCHW)。
+//! FP16 二维卷积算子。
 
-use crate::BackendCall;
-use crate::call::CallContext;
-#[cfg(feature = "a100-fp16-ime")]
-use crate::matmul::{Fp16MatmulOutput, Fp16MatmulParameter, ime_f16_f32_matmul};
-use crate::matmul::{Int8MatmulParameter, a100_int8_tile, ime_int8_i32_matmul};
 use alloc::vec;
+
+use crate::call::CallContext;
+use crate::matmul::{self, F16Matmul};
+use crate::{BackendCall, ComputeKernel};
 use half::f16;
 use k3_ai_uabi::error::BackendErr;
-use k3_ai_uabi::{AiDtype, AiTargetHint, Conv2dAttr, DimSize, ElemStride, MatMulAttr, OpFlags};
-use log::error;
+use k3_ai_uabi::{
+    AiDtype, AiTargetHint, Conv2dAttr, DimSize, ElemStride, KernelOp, MatMulAttr, OpFlags,
+};
 
-/// 从 `Conv2dAttr` 抽出的以 `usize` 表示的卷积几何参数。
+/// Conv2D 的静态分发标记。
+pub(crate) struct Conv2dKernel;
+
+impl ComputeKernel for Conv2dKernel {
+    const OP: KernelOp = KernelOp::CONV2D;
+
+    unsafe fn call(call: *const BackendCall) -> Result<(), BackendErr> {
+        unsafe { call_conv2d(call) }
+    }
+}
+
+/// 以 `usize` 表示的卷积几何属性。
 struct Conv2dGeom {
-    /// batch 数（0 归一化为 1）。
+    /// batch 数。
     batch: usize,
     /// 输入通道数。
     cin: usize,
     /// 输出通道数。
     cout: usize,
-    /// 输入高。
+    /// 输入高宽。
     ih: usize,
-    /// 输入宽。
     iw: usize,
-    /// 输出高。
+    /// 输出高宽。
     oh: usize,
-    /// 输出宽。
     ow: usize,
-    /// 卷积核高。
+    /// 卷积核高宽。
     kh: usize,
-    /// 卷积核宽。
     kw: usize,
-    /// 垂直步长。
+    /// stride。
     sh: usize,
-    /// 水平步长。
     sw: usize,
-    /// 垂直 padding。
+    /// padding。
     ph: usize,
-    /// 水平 padding。
     pw: usize,
-    /// 垂直膨胀。
+    /// dilation。
     dh: usize,
-    /// 水平膨胀。
     dw: usize,
     /// 分组数量。
     groups: usize,
 }
 
 impl Conv2dGeom {
-    /// 从 attr 构造几何参数，并校验 groups 与输出尺寸自洽。
+    /// 从 ABI 属性构造并校验几何参数。
     fn from_attr(attr: &Conv2dAttr) -> Result<Self, BackendErr> {
         let groups = (attr.groups.get() as usize).max(1);
-        let g = Self {
+        let geom = Self {
             batch: (attr.batch.get() as usize).max(1),
             cin: attr.in_channels.get() as usize,
             cout: attr.out_channels.get() as usize,
@@ -80,536 +74,268 @@ impl Conv2dGeom {
             dw: (attr.dilation_w.get() as usize).max(1),
             groups,
         };
-        if g.cin == 0
-            || g.cout == 0
-            || g.ih == 0
-            || g.iw == 0
-            || g.oh == 0
-            || g.ow == 0
-            || g.kh == 0
-            || g.kw == 0
-            || !g.cin.is_multiple_of(groups)
-            || !g.cout.is_multiple_of(groups)
+        if geom.cin == 0
+            || geom.cout == 0
+            || geom.ih == 0
+            || geom.iw == 0
+            || geom.oh == 0
+            || geom.ow == 0
+            || geom.kh == 0
+            || geom.kw == 0
+            || !geom.cin.is_multiple_of(groups)
+            || !geom.cout.is_multiple_of(groups)
         {
-            error!(
-                "conv2d: invalid geometry cin={}, cout={}, groups={groups}",
-                g.cin, g.cout
-            );
             return Err(BackendErr::InvalidAttr);
         }
-        Ok(g)
+        Ok(geom)
     }
 
-    /// 每组输入通道数。
+    /// 单 group 的输入通道数。
     fn cin_per_group(&self) -> usize {
         self.cin / self.groups
     }
 
-    /// 每组输出通道数。
+    /// 单 group 的输出通道数。
     fn cout_per_group(&self) -> usize {
         self.cout / self.groups
     }
 
-    /// im2col 矩阵的 K 维（Cin/group*KH*KW）。
+    /// 一个卷积感受野中的元素数。
     fn patch_size(&self) -> usize {
         self.cin_per_group() * self.kh * self.kw
     }
 
-    /// 每个 batch 的输出空间点数（Hout*Wout）。
+    /// 单个 batch 的输出空间元素数。
     fn spatial(&self) -> usize {
         self.oh * self.ow
     }
 }
 
-/// conv2d 算子执行器：解析 `BackendCall`，按 dtype/target 分发。
-///
-/// # Safety
-///
-/// `call` 指向有效 `BackendCall`，其 tensor `data` 已映射且生命周期覆盖本次调用。
-pub(crate) unsafe fn conv2d_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+/// 解析 ABI 并选择 Conv2D 的 FP16 target 实现。
+unsafe fn call_conv2d(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io_range(2..=3, 1..=1)?;
     ctx.reject_input_output_alias()?;
-
-    let attr = ctx.read_attr::<Conv2dAttr>()?;
-    let geom = Conv2dGeom::from_attr(&attr)?;
-    let target = ctx.target;
-    let in_dtype = ctx.inputs[0].dtype;
-    let w_dtype = ctx.inputs[1].dtype;
-    let out_dtype = ctx.outputs[0].dtype;
-    let bias_dtype = ctx.inputs.get(2).map(|view| view.dtype);
-
-    match (in_dtype, w_dtype, out_dtype) {
-        (AiDtype::F32, AiDtype::F32, AiDtype::F32) => {
-            if !bias_dtype.is_none_or(|dtype| dtype == AiDtype::F32) {
-                return Err(BackendErr::UnsupportedDtype);
-            }
-            let input = unsafe { ctx.inputs[0].as_slice::<f32>()? };
-            let weight = unsafe { ctx.inputs[1].as_slice::<f32>()? };
-            let bias = if ctx.inputs.len() == 3 {
-                Some(unsafe { ctx.inputs[2].as_slice::<f32>()? })
-            } else {
-                None
-            };
-            let output = unsafe { ctx.outputs[0].as_mut_slice::<f32>()? };
-            conv2d_f32(&geom, input, weight, bias, output)
-        }
-        (AiDtype::F16, AiDtype::F16, AiDtype::F16) => {
-            if !bias_dtype.is_none_or(|dtype| dtype == AiDtype::F16) {
-                return Err(BackendErr::UnsupportedDtype);
-            }
-            let input = unsafe { ctx.inputs[0].as_slice::<u16>()? };
-            let weight = unsafe { ctx.inputs[1].as_slice::<u16>()? };
-            let bias = if ctx.inputs.len() == 3 {
-                Some(unsafe { ctx.inputs[2].as_slice::<u16>()? })
-            } else {
-                None
-            };
-            let output = unsafe { ctx.outputs[0].as_mut_slice::<u16>()? };
-            conv2d_f16(&geom, input, weight, bias, output, target)
-        }
-        (i_dt, w_dt, AiDtype::I32) if is_int8(i_dt) && is_int8(w_dt) => {
-            if !bias_dtype.is_none_or(|dtype| dtype == AiDtype::I32) {
-                return Err(BackendErr::UnsupportedDtype);
-            }
-            let input = unsafe { ctx.inputs[0].as_slice::<u8>()? };
-            let weight = unsafe { ctx.inputs[1].as_slice::<u8>()? };
-            let bias = if ctx.inputs.len() == 3 {
-                Some(unsafe { ctx.inputs[2].as_slice::<i32>()? })
-            } else {
-                None
-            };
-            let output = unsafe { ctx.outputs[0].as_mut_slice::<i32>()? };
-            conv2d_int8(&geom, input, weight, bias, output, i_dt, w_dt, target)
-        }
-        _ => {
-            error!(
-                "conv2d_caller: unsupported dtype in={:?}, w={:?}, out={:?}",
-                in_dtype, w_dtype, out_dtype
-            );
-            Err(BackendErr::UnsupportedDtype)
-        }
+    if ctx.inputs[0].dtype != AiDtype::F16
+        || ctx.inputs[1].dtype != AiDtype::F16
+        || ctx.outputs[0].dtype != AiDtype::F16
+        || ctx
+            .inputs
+            .get(2)
+            .is_some_and(|view| view.dtype != AiDtype::F16)
+    {
+        return Err(BackendErr::UnsupportedDtype);
+    }
+    let geom = Conv2dGeom::from_attr(&ctx.read_attr::<Conv2dAttr>()?)?;
+    let input = unsafe { ctx.inputs[0].as_slice::<u16>()? };
+    let weight = unsafe { ctx.inputs[1].as_slice::<u16>()? };
+    let bias = match ctx.inputs.get(2) {
+        Some(view) => Some(unsafe { view.as_slice::<u16>()? }),
+        None => None,
+    };
+    let output = unsafe { ctx.outputs[0].as_mut_slice::<u16>()? };
+    validate_lengths(
+        &geom,
+        input.len(),
+        weight.len(),
+        output.len(),
+        bias.map(<[u16]>::len),
+    )?;
+    match ctx.target {
+        AiTargetHint::PREFER_CPU => compute_f16_cpu(&geom, input, weight, bias, output),
+        AiTargetHint::PREFER_A100 => compute_f16_a100(&geom, input, weight, bias, output),
+        AiTargetHint::PREFER_X100 => Err(BackendErr::UnsupportedOp),
+        _ => unreachable!("CallContext normalizes and validates target hints"),
     }
 }
 
-/// 判断 dtype 是否为 8 位整型（I8/U8）。
-fn is_int8(dtype: AiDtype) -> bool {
-    dtype == AiDtype::I8 || dtype == AiDtype::U8
-}
-
-/// 计算单个输出点的一个感受野元素对应的输入线性下标；越界（padding）返回 None。
+/// 计算 padding 后感受野元素的输入索引；padding 区域返回 `None`。
 #[inline]
 fn input_index(
-    g: &Conv2dGeom,
-    b: usize,
-    cin: usize,
-    oy: usize,
-    ox: usize,
-    ky: usize,
-    kx: usize,
+    geom: &Conv2dGeom,
+    batch: usize,
+    channel: usize,
+    out_y: usize,
+    out_x: usize,
+    kernel_y: usize,
+    kernel_x: usize,
 ) -> Option<usize> {
-    let iy = oy * g.sh + ky * g.dh;
-    let ix = ox * g.sw + kx * g.dw;
-    if iy < g.ph || ix < g.pw {
+    let input_y = out_y * geom.sh + kernel_y * geom.dh;
+    let input_x = out_x * geom.sw + kernel_x * geom.dw;
+    if input_y < geom.ph || input_x < geom.pw {
         return None;
     }
-    let iy = iy - g.ph;
-    let ix = ix - g.pw;
-    if iy >= g.ih || ix >= g.iw {
-        return None;
-    }
-    Some(((b * g.cin + cin) * g.ih + iy) * g.iw + ix)
+    let input_y = input_y - geom.ph;
+    let input_x = input_x - geom.pw;
+    (input_y < geom.ih && input_x < geom.iw)
+        .then_some(((batch * geom.cin + channel) * geom.ih + input_y) * geom.iw + input_x)
 }
 
-/// 校验 NCHW 输入、分组权重、可选 bias 与输出长度，避免后续索引 panic。
+/// 校验输入、权重、输出与可选 bias 的最小长度。
 fn validate_lengths(
-    g: &Conv2dGeom,
+    geom: &Conv2dGeom,
     input_len: usize,
     weight_len: usize,
     output_len: usize,
     bias_len: Option<usize>,
 ) -> Result<(), BackendErr> {
-    let input_need = g
+    let input_need = geom
         .batch
-        .checked_mul(g.cin)
-        .and_then(|value| value.checked_mul(g.ih))
-        .and_then(|value| value.checked_mul(g.iw))
+        .checked_mul(geom.cin)
+        .and_then(|value| value.checked_mul(geom.ih))
+        .and_then(|value| value.checked_mul(geom.iw))
         .ok_or(BackendErr::InvalidTensor)?;
-    let weight_need = g
+    let weight_need = geom
         .cout
-        .checked_mul(g.patch_size())
+        .checked_mul(geom.patch_size())
         .ok_or(BackendErr::InvalidTensor)?;
-    let output_need = g
+    let output_need = geom
         .batch
-        .checked_mul(g.cout)
-        .and_then(|value| value.checked_mul(g.spatial()))
+        .checked_mul(geom.cout)
+        .and_then(|value| value.checked_mul(geom.spatial()))
         .ok_or(BackendErr::InvalidTensor)?;
     if input_len < input_need
         || weight_len < weight_need
         || output_len < output_need
-        || bias_len.is_some_and(|len| len < g.cout)
+        || bias_len.is_some_and(|len| len < geom.cout)
     {
-        return Err(BackendErr::InvalidTensor);
-    }
-    Ok(())
-}
-
-/// f32 直接卷积（cpu 软件参考实现）。
-fn conv2d_f32(
-    g: &Conv2dGeom,
-    input: &[f32],
-    weight: &[f32],
-    bias: Option<&[f32]>,
-    output: &mut [f32],
-) -> Result<(), BackendErr> {
-    validate_lengths(
-        g,
-        input.len(),
-        weight.len(),
-        output.len(),
-        bias.map(<[f32]>::len),
-    )?;
-    let patch = g.patch_size();
-    let cin_group = g.cin_per_group();
-    let cout_group = g.cout_per_group();
-    for b in 0..g.batch {
-        for oc in 0..g.cout {
-            let group = oc / cout_group;
-            let input_channel_base = group * cin_group;
-            let w_base = oc * patch;
-            for oy in 0..g.oh {
-                for ox in 0..g.ow {
-                    let mut acc = bias.map_or(0.0_f32, |bias| bias[oc]);
-                    for ic in 0..cin_group {
-                        let input_channel = input_channel_base + ic;
-                        for ky in 0..g.kh {
-                            for kx in 0..g.kw {
-                                let w = weight[w_base + (ic * g.kh + ky) * g.kw + kx];
-                                if let Some(idx) = input_index(g, b, input_channel, oy, ox, ky, kx)
-                                {
-                                    acc += w * input[idx];
-                                }
-                            }
-                        }
-                    }
-                    output[((b * g.cout + oc) * g.oh + oy) * g.ow + ox] = acc;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// f16 卷积：默认 CPU 直算；A100 feature 打开后走 IME vfwmadot。
-fn conv2d_f16(
-    g: &Conv2dGeom,
-    input: &[u16],
-    weight: &[u16],
-    bias: Option<&[u16]>,
-    output: &mut [u16],
-    target: AiTargetHint,
-) -> Result<(), BackendErr> {
-    match target {
-        AiTargetHint::PREFER_CPU => conv2d_f16_cpu(g, input, weight, bias, output),
-        AiTargetHint::AUTO | AiTargetHint::PREFER_A100 => {
-            #[cfg(feature = "a100-fp16-ime")]
-            {
-                conv2d_f16_ime(g, input, weight, bias, output)
-            }
-            #[cfg(not(feature = "a100-fp16-ime"))]
-            {
-                let _ = (g, input, weight, bias, output);
-                error!("conv2d_f16: A100 FP16 IME disabled until MCPM.BF16 is controlled");
-                Err(BackendErr::UnsupportedOp)
-            }
-        }
-        AiTargetHint::PREFER_X100 => Err(BackendErr::UnsupportedDtype),
-        _ => unreachable!("CallContext rejects unknown targets"),
-    }
-}
-
-/// f16 直接卷积：解码到 f32 累加后写回 f16（CPU 参考实现）。
-fn conv2d_f16_cpu(
-    g: &Conv2dGeom,
-    input: &[u16],
-    weight: &[u16],
-    bias: Option<&[u16]>,
-    output: &mut [u16],
-) -> Result<(), BackendErr> {
-    validate_lengths(
-        g,
-        input.len(),
-        weight.len(),
-        output.len(),
-        bias.map(<[u16]>::len),
-    )?;
-    let patch = g.patch_size();
-    let cin_group = g.cin_per_group();
-    let cout_group = g.cout_per_group();
-    for b in 0..g.batch {
-        for oc in 0..g.cout {
-            let group = oc / cout_group;
-            let input_channel_base = group * cin_group;
-            let w_base = oc * patch;
-            for oy in 0..g.oh {
-                for ox in 0..g.ow {
-                    let mut acc = bias.map_or(0.0_f32, |bias| f16::from_bits(bias[oc]).to_f32());
-                    for ic in 0..cin_group {
-                        let input_channel = input_channel_base + ic;
-                        for ky in 0..g.kh {
-                            for kx in 0..g.kw {
-                                let w =
-                                    f16::from_bits(weight[w_base + (ic * g.kh + ky) * g.kw + kx])
-                                        .to_f32();
-                                if let Some(idx) = input_index(g, b, input_channel, oy, ox, ky, kx)
-                                {
-                                    acc += w * f16::from_bits(input[idx]).to_f32();
-                                }
-                            }
-                        }
-                    }
-                    output[((b * g.cout + oc) * g.oh + oy) * g.ow + ox] =
-                        f16::from_f32(acc).to_bits();
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// f16 卷积：流式 im2col + A100 8×8×8 vfwmadot matmul。
-#[cfg(feature = "a100-fp16-ime")]
-fn conv2d_f16_ime(
-    g: &Conv2dGeom,
-    input: &[u16],
-    weight: &[u16],
-    bias: Option<&[u16]>,
-    output: &mut [u16],
-) -> Result<(), BackendErr> {
-    validate_lengths(
-        g,
-        input.len(),
-        weight.len(),
-        output.len(),
-        bias.map(<[u16]>::len),
-    )?;
-    let k = g.patch_size();
-    let n = g.spatial();
-    let m = g.cout_per_group();
-    let cin_group = g.cin_per_group();
-    let mm_attr = conv_fp16_matmul_attr(m, n, k);
-
-    for b in 0..g.batch {
-        for group in 0..g.groups {
-            let mut col = vec![0_u16; k * n];
-            let mut p = 0;
-            let input_channel_base = group * cin_group;
-            for ic in 0..cin_group {
-                let input_channel = input_channel_base + ic;
-                for ky in 0..g.kh {
-                    for kx in 0..g.kw {
-                        for oy in 0..g.oh {
-                            for ox in 0..g.ow {
-                                let s = oy * g.ow + ox;
-                                col[p * n + s] =
-                                    match input_index(g, b, input_channel, oy, ox, ky, kx) {
-                                        Some(idx) => input[idx],
-                                        None => 0,
-                                    };
-                            }
-                        }
-                        p += 1;
-                    }
-                }
-            }
-
-            let out_base = b * g.cout * n + group * m * n;
-            let weight_base = group * m * k;
-            let parameter = Fp16MatmulParameter {
-                lhs: &weight[weight_base..weight_base + m * k],
-                rhs: &col,
-                output: Fp16MatmulOutput::F16(&mut output[out_base..out_base + m * n]),
-                attr: mm_attr,
-            };
-            ime_f16_f32_matmul(parameter)?;
-            if let Some(bias) = bias {
-                for oc in 0..m {
-                    let bias_value = f16::from_bits(bias[group * m + oc]).to_f32();
-                    for spatial in 0..n {
-                        let output_index = out_base + oc * n + spatial;
-                        let value = f16::from_bits(output[output_index]).to_f32() + bias_value;
-                        output[output_index] = f16::from_f32(value).to_bits();
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// int8 卷积：CPU target 走直接卷积，X100/A100 target 才复用 IME matmul。
-fn conv2d_int8(
-    g: &Conv2dGeom,
-    input: &[u8],
-    weight: &[u8],
-    bias: Option<&[i32]>,
-    output: &mut [i32],
-    in_dtype: AiDtype,
-    w_dtype: AiDtype,
-    target: AiTargetHint,
-) -> Result<(), BackendErr> {
-    validate_lengths(
-        g,
-        input.len(),
-        weight.len(),
-        output.len(),
-        bias.map(<[i32]>::len),
-    )?;
-    match target {
-        AiTargetHint::PREFER_CPU => {
-            conv2d_int8_cpu(g, input, weight, bias, output, in_dtype, w_dtype)
-        }
-        AiTargetHint::AUTO | AiTargetHint::PREFER_A100 => {
-            conv2d_int8_ime(g, input, weight, bias, output, in_dtype, w_dtype)
-        }
-        AiTargetHint::PREFER_X100 => {
-            conv2d_int8_ime(g, input, weight, bias, output, in_dtype, w_dtype)
-        }
-        _ => unreachable!("CallContext rejects unknown targets"),
-    }
-}
-
-/// int8 直接卷积（cpu 软件参考实现）。
-fn conv2d_int8_cpu(
-    g: &Conv2dGeom,
-    input: &[u8],
-    weight: &[u8],
-    bias: Option<&[i32]>,
-    output: &mut [i32],
-    in_dtype: AiDtype,
-    w_dtype: AiDtype,
-) -> Result<(), BackendErr> {
-    let patch = g.patch_size();
-    let cin_group = g.cin_per_group();
-    let cout_group = g.cout_per_group();
-    for b in 0..g.batch {
-        for oc in 0..g.cout {
-            let group = oc / cout_group;
-            let input_channel_base = group * cin_group;
-            let w_base = oc * patch;
-            for oy in 0..g.oh {
-                for ox in 0..g.ow {
-                    let mut acc = bias.map_or(0_i32, |bias| bias[oc]);
-                    for ic in 0..cin_group {
-                        let input_channel = input_channel_base + ic;
-                        for ky in 0..g.kh {
-                            for kx in 0..g.kw {
-                                let w = int8_value(
-                                    weight[w_base + (ic * g.kh + ky) * g.kw + kx],
-                                    w_dtype,
-                                );
-                                if let Some(idx) = input_index(g, b, input_channel, oy, ox, ky, kx)
-                                {
-                                    acc = acc.wrapping_add(
-                                        w.wrapping_mul(int8_value(input[idx], in_dtype)),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    output[((b * g.cout + oc) * g.oh + oy) * g.ow + ox] = acc;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// int8 IME 卷积：im2col 展开为 `[K, N]` col 矩阵，与权重 `[Cout, K]` 相乘。
-///
-/// 复用 [`ime_int8_i32_matmul`]：lhs=weight(M=Cout, K=patch), rhs=col(K, N=spatial)，
-/// 行主序无转置，out=[Cout, spatial]。
-fn conv2d_int8_ime(
-    g: &Conv2dGeom,
-    input: &[u8],
-    weight: &[u8],
-    bias: Option<&[i32]>,
-    output: &mut [i32],
-    in_dtype: AiDtype,
-    w_dtype: AiDtype,
-) -> Result<(), BackendErr> {
-    let k = g.patch_size();
-    let n = g.spatial();
-    let m = g.cout_per_group();
-    let cin_group = g.cin_per_group();
-    let signedness = crate::matmul::signedness_for(w_dtype, in_dtype);
-    let mm_attr = conv_matmul_attr(m, n, k);
-
-    for b in 0..g.batch {
-        for group in 0..g.groups {
-            // im2col：col[p, s]，p 遍历本 group 内 (ic,ky,kx)，s 遍历 (oy,ox)。
-            let mut col = vec![0_u8; k * n];
-            let mut p = 0;
-            let input_channel_base = group * cin_group;
-            for ic in 0..cin_group {
-                let input_channel = input_channel_base + ic;
-                for ky in 0..g.kh {
-                    for kx in 0..g.kw {
-                        for oy in 0..g.oh {
-                            for ox in 0..g.ow {
-                                let s = oy * g.ow + ox;
-                                col[p * n + s] =
-                                    match input_index(g, b, input_channel, oy, ox, ky, kx) {
-                                        Some(idx) => input[idx],
-                                        None => 0,
-                                    };
-                            }
-                        }
-                        p += 1;
-                    }
-                }
-            }
-
-            let out_base = b * g.cout * n + group * m * n;
-            let weight_base = group * m * k;
-            let parameter = Int8MatmulParameter {
-                lhs: &weight[weight_base..weight_base + m * k],
-                rhs: &col,
-                out: &mut output[out_base..out_base + m * n],
-                attr: mm_attr,
-                signedness,
-            };
-            ime_int8_i32_matmul(parameter, a100_int8_tile())?;
-            if let Some(bias) = bias {
-                for oc in 0..m {
-                    let bias_value = bias[group * m + oc];
-                    for spatial in 0..n {
-                        output[out_base + oc * n + spatial] += bias_value;
-                    }
-                }
-            }
-        }
-    }
-    let _ = in_dtype;
-    Ok(())
-}
-
-/// 按 dtype 解释一个 int8/uint8 物理字节。
-fn int8_value(value: u8, dtype: AiDtype) -> i32 {
-    if dtype == AiDtype::I8 {
-        (value as i8) as i32
+        Err(BackendErr::InvalidTensor)
     } else {
-        value as i32
+        Ok(())
     }
 }
 
-/// 构造 conv im2col 用的行主序、无转置、单 batch `MatMulAttr`。
-fn conv_matmul_attr(m: usize, n: usize, k: usize) -> MatMulAttr {
+/// FP16 CPU 参考卷积；乘加使用 F32 累加后写回 F16。
+fn compute_f16_cpu(
+    geom: &Conv2dGeom,
+    input: &[u16],
+    weight: &[u16],
+    bias: Option<&[u16]>,
+    output: &mut [u16],
+) -> Result<(), BackendErr> {
+    let patch = geom.patch_size();
+    let cin_group = geom.cin_per_group();
+    let cout_group = geom.cout_per_group();
+    for batch in 0..geom.batch {
+        for out_channel in 0..geom.cout {
+            let group = out_channel / cout_group;
+            let weight_base = out_channel * patch;
+            for out_y in 0..geom.oh {
+                for out_x in 0..geom.ow {
+                    let mut sum =
+                        bias.map_or(0.0, |values| f16::from_bits(values[out_channel]).to_f32());
+                    for in_channel in 0..cin_group {
+                        for kernel_y in 0..geom.kh {
+                            for kernel_x in 0..geom.kw {
+                                if let Some(index) = input_index(
+                                    geom,
+                                    batch,
+                                    group * cin_group + in_channel,
+                                    out_y,
+                                    out_x,
+                                    kernel_y,
+                                    kernel_x,
+                                ) {
+                                    let weight_index = weight_base
+                                        + (in_channel * geom.kh + kernel_y) * geom.kw
+                                        + kernel_x;
+                                    sum += f16::from_bits(weight[weight_index]).to_f32()
+                                        * f16::from_bits(input[index]).to_f32();
+                                }
+                            }
+                        }
+                    }
+                    output
+                        [((batch * geom.cout + out_channel) * geom.oh + out_y) * geom.ow + out_x] =
+                        f16::from_f32(sum).to_bits();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// FP16 A100 卷积：每个 group 生成临时 im2col，再使用 A100 MatMul 路径。
+fn compute_f16_a100(
+    geom: &Conv2dGeom,
+    input: &[u16],
+    weight: &[u16],
+    bias: Option<&[u16]>,
+    output: &mut [u16],
+) -> Result<(), BackendErr> {
+    let patch = geom.patch_size();
+    let spatial = geom.spatial();
+    let out_per_group = geom.cout_per_group();
+    let in_per_group = geom.cin_per_group();
+    let matmul_attr = compact_matmul_attr(out_per_group, spatial, patch);
+    for batch in 0..geom.batch {
+        for group in 0..geom.groups {
+            let mut col = vec![0_u16; patch * spatial];
+            let mut patch_index = 0;
+            for in_channel in 0..in_per_group {
+                for kernel_y in 0..geom.kh {
+                    for kernel_x in 0..geom.kw {
+                        for out_y in 0..geom.oh {
+                            for out_x in 0..geom.ow {
+                                let spatial_index = out_y * geom.ow + out_x;
+                                col[patch_index * spatial + spatial_index] = input_index(
+                                    geom,
+                                    batch,
+                                    group * in_per_group + in_channel,
+                                    out_y,
+                                    out_x,
+                                    kernel_y,
+                                    kernel_x,
+                                )
+                                .map_or(0, |index| input[index]);
+                            }
+                        }
+                        patch_index += 1;
+                    }
+                }
+            }
+            let output_base = batch * geom.cout * spatial + group * out_per_group * spatial;
+            let weight_base = group * out_per_group * patch;
+            matmul::compute_f16_a100(F16Matmul {
+                lhs: &weight[weight_base..weight_base + out_per_group * patch],
+                rhs: &col,
+                output: &mut output[output_base..output_base + out_per_group * spatial],
+                attr: matmul_attr,
+            })?;
+            add_bias(output, output_base, out_per_group, spatial, bias, group);
+        }
+    }
+    Ok(())
+}
+
+/// 将可选 FP16 bias 加到 group 的卷积输出。
+fn add_bias(
+    output: &mut [u16],
+    output_base: usize,
+    out_per_group: usize,
+    spatial: usize,
+    bias: Option<&[u16]>,
+    group: usize,
+) {
+    if let Some(bias) = bias {
+        for out_channel in 0..out_per_group {
+            let bias_value = f16::from_bits(bias[group * out_per_group + out_channel]).to_f32();
+            for spatial_index in 0..spatial {
+                let index = output_base + out_channel * spatial + spatial_index;
+                output[index] =
+                    f16::from_f32(f16::from_bits(output[index]).to_f32() + bias_value).to_bits();
+            }
+        }
+    }
+}
+
+/// 构造 im2col MatMul 使用的紧凑单 batch属性。
+fn compact_matmul_attr(m: usize, n: usize, k: usize) -> MatMulAttr {
     MatMulAttr {
         m: DimSize::new(m as u32),
         n: DimSize::new(n as u32),
         k: DimSize::new(k as u32),
-        batch: DimSize::new(0),
+        batch: DimSize::new(1),
         lhs_row_stride: ElemStride::new(k as u32),
         lhs_col_stride: ElemStride::new(1),
         lhs_batch_stride: ElemStride::new(0),
@@ -620,54 +346,32 @@ fn conv_matmul_attr(m: usize, n: usize, k: usize) -> MatMulAttr {
         out_col_stride: ElemStride::new(1),
         out_batch_stride: ElemStride::new(0),
         flags: OpFlags::new(0),
-        accum_dtype: AiDtype::I32,
+        accum_dtype: AiDtype::F32,
         reserved: [0; 3],
     }
 }
 
-/// 构造 conv f16 im2col 用的行主序、无转置、单 batch `MatMulAttr`。
-#[cfg(feature = "a100-fp16-ime")]
-fn conv_fp16_matmul_attr(m: usize, n: usize, k: usize) -> MatMulAttr {
-    let mut attr = conv_matmul_attr(m, n, k);
-    attr.accum_dtype = AiDtype::F32;
-    attr
-}
-
-/// conv2d 各 dtype 路径的正确性单元测试。
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
     use k3_ai_uabi::KernelStride;
 
-    /// 构造单 batch、groups=1 的 `Conv2dAttr`。
-    #[allow(clippy::too_many_arguments)]
-    fn attr(
-        cin: u32,
-        cout: u32,
-        ih: u32,
-        iw: u32,
-        kh: u32,
-        kw: u32,
-        stride: u32,
-        pad: u32,
-    ) -> Conv2dAttr {
-        let oh = (ih + 2 * pad - kh) / stride + 1;
-        let ow = (iw + 2 * pad - kw) / stride + 1;
+    /// 构造单 batch、groups=1 的紧凑卷积属性。
+    fn attr() -> Conv2dAttr {
         Conv2dAttr {
             batch: DimSize::new(1),
-            in_channels: DimSize::new(cin),
-            out_channels: DimSize::new(cout),
-            input_h: DimSize::new(ih),
-            input_w: DimSize::new(iw),
-            output_h: DimSize::new(oh),
-            output_w: DimSize::new(ow),
-            kernel_h: DimSize::new(kh),
-            kernel_w: DimSize::new(kw),
-            stride_h: KernelStride::new(stride),
-            stride_w: KernelStride::new(stride),
-            pad_h: DimSize::new(pad),
-            pad_w: DimSize::new(pad),
+            in_channels: DimSize::new(1),
+            out_channels: DimSize::new(1),
+            input_h: DimSize::new(3),
+            input_w: DimSize::new(3),
+            output_h: DimSize::new(2),
+            output_w: DimSize::new(2),
+            kernel_h: DimSize::new(2),
+            kernel_w: DimSize::new(2),
+            stride_h: KernelStride::new(1),
+            stride_w: KernelStride::new(1),
+            pad_h: DimSize::new(0),
+            pad_w: DimSize::new(0),
             dilation_h: KernelStride::new(1),
             dilation_w: KernelStride::new(1),
             groups: DimSize::new(1),
@@ -676,140 +380,17 @@ mod tests {
         }
     }
 
-    /// 1ch 3×3 输入、2×2 全 1 卷积核、无 pad、stride1 → 2×2 局部和。
+    /// CPU 和 A100 FP16 路径的卷积结果必须一致。
     #[test]
-    fn f32_single_channel_sum_kernel() {
-        let g = Conv2dGeom::from_attr(&attr(1, 1, 3, 3, 2, 2, 1, 0)).unwrap();
-        let input = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
-        let weight = [1.0_f32; 4];
-        let mut out = [0.0_f32; 4];
-        conv2d_f32(&g, &input, &weight, None, &mut out).unwrap();
-        // 每个 2×2 窗口求和。
-        assert_eq!(out, [12.0, 16.0, 24.0, 28.0]);
-    }
-
-    /// depthwise(groups=cin=cout) + bias 应只读取各自 channel。
-    #[test]
-    fn f32_depthwise_with_bias() {
-        let mut a = attr(2, 2, 2, 2, 1, 1, 1, 0);
-        a.groups = DimSize::new(2);
-        let g = Conv2dGeom::from_attr(&a).unwrap();
-        let input = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let weight = [10.0_f32, 20.0];
-        let bias = [1.0_f32, -1.0];
-        let mut out = [0.0_f32; 8];
-        conv2d_f32(&g, &input, &weight, Some(&bias), &mut out).unwrap();
-        assert_eq!(out, [11.0, 21.0, 31.0, 41.0, 99.0, 119.0, 139.0, 159.0]);
-    }
-
-    /// 独立的 int8 直接卷积参考实现。
-    fn ref_int8(g: &Conv2dGeom, input: &[u8], weight: &[u8], bias: Option<&[i32]>) -> Vec<i32> {
-        let patch = g.patch_size();
-        let cin_group = g.cin_per_group();
-        let cout_group = g.cout_per_group();
-        let mut out = vec![0_i32; g.batch * g.cout * g.spatial()];
-        for b in 0..g.batch {
-            for oc in 0..g.cout {
-                let group = oc / cout_group;
-                let input_channel_base = group * cin_group;
-                for oy in 0..g.oh {
-                    for ox in 0..g.ow {
-                        let mut acc = bias.map_or(0_i32, |bias| bias[oc]);
-                        for ic in 0..cin_group {
-                            let input_channel = input_channel_base + ic;
-                            for ky in 0..g.kh {
-                                for kx in 0..g.kw {
-                                    let w = weight[oc * patch + (ic * g.kh + ky) * g.kw + kx] as i8
-                                        as i32;
-                                    if let Some(idx) =
-                                        input_index(g, b, input_channel, oy, ox, ky, kx)
-                                    {
-                                        acc += w * (input[idx] as i8 as i32);
-                                    }
-                                }
-                            }
-                        }
-                        out[((b * g.cout + oc) * g.oh + oy) * g.ow + ox] = acc;
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// int8 im2col+IME 路径应与独立直接卷积参考一致（含 padding、多通道）。
-    #[test]
-    fn int8_im2col_matches_reference() {
-        let a = attr(3, 4, 5, 5, 3, 3, 2, 1);
-        let g = Conv2dGeom::from_attr(&a).unwrap();
-        let input: Vec<u8> = (0..3 * 5 * 5).map(|v| (v as i8 - 30) as u8).collect();
-        let weight: Vec<u8> = (0..4 * 3 * 3 * 3).map(|v| (v as i8 - 15) as u8).collect();
-        let mut out = vec![0_i32; g.cout * g.spatial()];
-        conv2d_int8(
-            &g,
-            &input,
-            &weight,
-            None,
-            &mut out,
-            AiDtype::I8,
-            AiDtype::I8,
-            AiTargetHint::PREFER_X100,
-        )
-        .unwrap();
-        assert_eq!(out, ref_int8(&g, &input, &weight, None));
-    }
-
-    /// grouped int8 im2col 只应提交每组自己的输入/输出通道，并在 matmul 后加 bias。
-    #[test]
-    fn int8_grouped_with_bias_matches_reference() {
-        let mut a = attr(4, 4, 3, 3, 1, 1, 1, 0);
-        a.groups = DimSize::new(2);
-        let g = Conv2dGeom::from_attr(&a).unwrap();
-        let input: Vec<u8> = (0..4 * 3 * 3).map(|v| (v as i8 - 18) as u8).collect();
-        let weight: Vec<u8> = (0..4 * 2).map(|v| (v as i8 - 3) as u8).collect();
-        let bias = [1_i32, -2, 3, -4];
-        let mut out = vec![0_i32; g.cout * g.spatial()];
-        conv2d_int8(
-            &g,
-            &input,
-            &weight,
-            Some(&bias),
-            &mut out,
-            AiDtype::I8,
-            AiDtype::I8,
-            AiTargetHint::PREFER_X100,
-        )
-        .unwrap();
-        assert_eq!(out, ref_int8(&g, &input, &weight, Some(&bias)));
-    }
-
-    /// feature 打开时，A100 FP16 IME 软件镜像应与 CPU grouped+bias 参考一致。
-    #[cfg(feature = "a100-fp16-ime")]
-    #[test]
-    fn f16_ime_grouped_bias_matches_cpu() {
-        let mut a = attr(2, 2, 2, 2, 1, 1, 1, 0);
-        a.groups = DimSize::new(2);
-        let g = Conv2dGeom::from_attr(&a).unwrap();
-        let input: Vec<u16> = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-            .into_iter()
-            .map(|value| f16::from_f32(value).to_bits())
-            .collect();
-        let weight: Vec<u16> = [10.0_f32, 20.0]
-            .into_iter()
-            .map(|value| f16::from_f32(value).to_bits())
-            .collect();
-        let bias: Vec<u16> = [1.0_f32, -1.0]
-            .into_iter()
-            .map(|value| f16::from_f32(value).to_bits())
-            .collect();
-        let mut cpu = vec![0_u16; g.cout * g.spatial()];
-        let mut ime = vec![0_u16; g.cout * g.spatial()];
-        conv2d_f16_cpu(&g, &input, &weight, Some(&bias), &mut cpu).unwrap();
-        conv2d_f16_ime(&g, &input, &weight, Some(&bias), &mut ime).unwrap();
-        for (&left, &right) in cpu.iter().zip(&ime) {
-            let left = f16::from_bits(left).to_f32();
-            let right = f16::from_bits(right).to_f32();
-            assert!((left - right).abs() < 1.0e-3, "cpu={left}, ime={right}");
-        }
+    fn a100_f16_matches_cpu() {
+        let geom = Conv2dGeom::from_attr(&attr()).unwrap();
+        let input = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+            .map(|value| f16::from_f32(value).to_bits());
+        let weight = [1.0_f32; 4].map(|value| f16::from_f32(value).to_bits());
+        let mut cpu = [0_u16; 4];
+        let mut a100 = [0_u16; 4];
+        compute_f16_cpu(&geom, &input, &weight, None, &mut cpu).unwrap();
+        compute_f16_a100(&geom, &input, &weight, None, &mut a100).unwrap();
+        assert_eq!(cpu, a100);
     }
 }

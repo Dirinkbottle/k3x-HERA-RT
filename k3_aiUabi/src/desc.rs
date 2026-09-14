@@ -129,7 +129,7 @@ impl AiTensorLayout {
 
 /// tensor 量化补充描述。
 ///
-/// 此处主要记录 block_size 和 scale dtype，方便 lowering/backend 做校验。
+/// 此处记录 block_size 和 scale dtype，以保持外部量化 tensor ABI 兼容。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct AiQuantDesc {

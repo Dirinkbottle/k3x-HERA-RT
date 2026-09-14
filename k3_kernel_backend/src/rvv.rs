@@ -1,11 +1,11 @@
-//! 聚合的 RVV 向量原语。
+//! FP16 路由使用的 RVV 向量原语。
 //!
 //! RISC-V 目标使用 VLA inline assembly；其他目标执行同语义软件镜像，便于单测。
 
 use alloc::vec;
 use k3_ai_uabi::error::BackendErr;
 
-/// 二元 F32 向量运算。
+/// FP16 工作缓冲的二元向量运算。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BinaryOp {
     /// 加法。
@@ -18,8 +18,8 @@ pub(crate) enum BinaryOp {
     Div,
 }
 
-/// 对等长 F32 切片执行向量二元运算。
-pub(crate) fn binary_f32(
+/// 对由 F16 tensor 解码出的等长工作缓冲执行向量二元运算。
+pub(crate) fn f16_binary_work(
     op: BinaryOp,
     lhs: &[f32],
     rhs: &[f32],
@@ -47,8 +47,8 @@ pub(crate) fn binary_f32(
     Ok(())
 }
 
-/// 对 F32 向量执行 `alpha * x + beta`。
-pub(crate) fn affine_f32(
+/// 对 F16 工作缓冲执行 `alpha * x + beta`。
+pub(crate) fn f16_affine_work(
     input: &[f32],
     output: &mut [f32],
     alpha: f32,
@@ -71,8 +71,8 @@ pub(crate) fn affine_f32(
     Ok(())
 }
 
-/// 计算向量 exp；硬件路径使用范围缩减和六阶多项式。
-pub(crate) fn exp_f32(input: &[f32], output: &mut [f32]) -> Result<(), BackendErr> {
+/// 计算 F16 工作缓冲的 exp；硬件路径使用范围缩减和六阶多项式。
+pub(crate) fn f16_exp_work(input: &[f32], output: &mut [f32]) -> Result<(), BackendErr> {
     if input.len() != output.len() {
         return Err(BackendErr::InvalidTensor);
     }
@@ -91,13 +91,13 @@ pub(crate) fn exp_f32(input: &[f32], output: &mut [f32]) -> Result<(), BackendEr
 }
 
 /// 计算 Sigmoid。
-pub(crate) fn sigmoid_f32(input: &[f32], output: &mut [f32]) -> Result<(), BackendErr> {
+pub(crate) fn f16_sigmoid_work(input: &[f32], output: &mut [f32]) -> Result<(), BackendErr> {
     if input.len() != output.len() {
         return Err(BackendErr::InvalidTensor);
     }
     let mut negated = vec![0.0_f32; input.len()];
-    affine_f32(input, &mut negated, -1.0, 0.0)?;
-    exp_f32(&negated, output)?;
+    f16_affine_work(input, &mut negated, -1.0, 0.0)?;
+    f16_exp_work(&negated, output)?;
 
     #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
     unsafe {
@@ -109,13 +109,6 @@ pub(crate) fn sigmoid_f32(input: &[f32], output: &mut [f32]) -> Result<(), Backe
         *value = 1.0 / (1.0 + *value);
     }
     Ok(())
-}
-
-/// 计算 SiLU。
-pub(crate) fn silu_f32(input: &[f32], output: &mut [f32]) -> Result<(), BackendErr> {
-    let mut sigmoid = vec![0.0_f32; input.len()];
-    sigmoid_f32(input, &mut sigmoid)?;
-    binary_f32(BinaryOp::Mul, input, &sigmoid, output)
 }
 
 /// 使用 RVV 或软件镜像复制任意字节区间。
@@ -171,40 +164,8 @@ pub(crate) fn gather_bytes(
     Ok(())
 }
 
-/// 把 I32 切片向量转换为 F32。
-pub(crate) fn cast_i32_to_f32(input: &[i32], output: &mut [f32]) -> Result<(), BackendErr> {
-    if input.len() != output.len() {
-        return Err(BackendErr::InvalidTensor);
-    }
-    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-    unsafe {
-        cast_i32_to_f32_hw(input, output);
-    }
-    #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
-    for (dst, &src) in output.iter_mut().zip(input) {
-        *dst = src as f32;
-    }
-    Ok(())
-}
-
-/// 把 F32 切片按向零截断规则向量转换为 I32。
-pub(crate) fn cast_f32_to_i32(input: &[f32], output: &mut [i32]) -> Result<(), BackendErr> {
-    if input.len() != output.len() {
-        return Err(BackendErr::InvalidTensor);
-    }
-    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-    unsafe {
-        cast_f32_to_i32_hw(input, output);
-    }
-    #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
-    for (dst, &src) in output.iter_mut().zip(input) {
-        *dst = src as i32;
-    }
-    Ok(())
-}
-
-/// 对 F32 切片执行向量求和。
-pub(crate) fn reduce_sum_f32(input: &[f32]) -> f32 {
+/// 对 FP16 路由的工作缓冲执行向量求和。
+pub(crate) fn f16_reduce_sum_work(input: &[f32]) -> f32 {
     #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
     unsafe {
         return reduce_f32_hw(input, false);
@@ -214,8 +175,8 @@ pub(crate) fn reduce_sum_f32(input: &[f32]) -> f32 {
     input.iter().copied().sum()
 }
 
-/// 对 F32 切片执行向量最大值归约。
-pub(crate) fn reduce_max_f32(input: &[f32]) -> f32 {
+/// 对 FP16 路由的工作缓冲执行向量最大值归约。
+pub(crate) fn f16_reduce_max_work(input: &[f32]) -> f32 {
     #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
     unsafe {
         return reduce_f32_hw(input, true);
@@ -662,11 +623,11 @@ mod tests {
         let input = [-2.0_f32, 0.0, 2.0];
         let rhs = [2.0_f32, 3.0, 4.0];
         let mut output = [0.0_f32; 3];
-        binary_f32(BinaryOp::Mul, &input, &rhs, &mut output).unwrap();
+        f16_binary_work(BinaryOp::Mul, &input, &rhs, &mut output).unwrap();
         assert_eq!(output, [-4.0, 0.0, 8.0]);
-        affine_f32(&input, &mut output, 2.0, 1.0).unwrap();
+        f16_affine_work(&input, &mut output, 2.0, 1.0).unwrap();
         assert_eq!(output, [-3.0, 1.0, 5.0]);
-        sigmoid_f32(&input, &mut output).unwrap();
+        f16_sigmoid_work(&input, &mut output).unwrap();
         assert!((output[1] - 0.5).abs() < 1.0e-6);
     }
 }

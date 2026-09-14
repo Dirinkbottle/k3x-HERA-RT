@@ -9,9 +9,9 @@ use crate::fronted::{
 #[test]
 fn build_matmul_kernel_desc() {
     let tensor_manager = TensorManager::new();
-    let lhs = tensor_manager.alloc_tensor(AiDtype::F32, &[3, 4]);
-    let rhs = tensor_manager.alloc_tensor(AiDtype::F32, &[4, 3]);
-    let output = tensor_manager.alloc_tensor(AiDtype::F32, &[3, 3]);
+    let lhs = tensor_manager.alloc_tensor(AiDtype::F16, &[3, 4]);
+    let rhs = tensor_manager.alloc_tensor(AiDtype::F16, &[4, 3]);
+    let output = tensor_manager.alloc_tensor(AiDtype::F16, &[3, 3]);
 
     let matmul_attr = MatMulAttr {
         m: DimSize::new(3),
@@ -52,7 +52,7 @@ fn build_matmul_kernel_desc() {
     assert_ne!(matmul_desc.tensors[0].user_va, 0);
     assert_ne!(matmul_desc.tensors[1].user_va, 0);
     assert_ne!(matmul_desc.tensors[2].user_va, 0);
-    assert_eq!(matmul_desc.tensors[0].size_bytes, 3 * 4 * 4);
-    assert_eq!(matmul_desc.tensors[1].size_bytes, 4 * 3 * 4);
-    assert_eq!(matmul_desc.tensors[2].size_bytes, 3 * 3 * 4);
+    assert_eq!(matmul_desc.tensors[0].size_bytes, 3 * 4 * 2);
+    assert_eq!(matmul_desc.tensors[1].size_bytes, 4 * 3 * 2);
+    assert_eq!(matmul_desc.tensors[2].size_bytes, 3 * 3 * 2);
 }

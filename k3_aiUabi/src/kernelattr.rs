@@ -128,7 +128,7 @@ pub struct SoftmaxAttr {
     pub axis: TensorAxis,
     /// 输入缩放系数（如 attention 的 1/sqrt(d)）。
     pub scale: f32,
-    /// GGML attention 的 ALiBi/max-bias 参数；v1 只接受 0。
+    /// 预留的 attention max-bias 参数；当前 backend 只接受 0。
     pub max_bias: f32,
     /// 算子 flags，具体含义由 backend 约定。
     pub flags: OpFlags,
@@ -154,44 +154,13 @@ pub struct BinaryAttr {
     pub reserved: [u32; 12],
 }
 
-/// GGML GetRows 参数。
-///
-/// 张量约定：
-/// - tensors[0] = data
-/// - tensors[1] = I32/I64 row indices
-/// - tensors[2] = output
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct GetRowsAttr {
-    /// 算子 flags，当前必须为 0。
-    pub flags: OpFlags,
-    /// 预留字段，保持固定 ABI 大小。
-    pub reserved: [u32; 15],
-}
-
-/// GGML SetRows 参数。
-///
-/// 张量约定：
-/// - tensors[0] = source rows
-/// - tensors[1] = I32/I64 row indices
-/// - tensors[2] = destination/base tensor
-/// - tensors[3] = output view of destination/base tensor
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct SetRowsAttr {
-    /// 算子 flags，当前必须为 0。
-    pub flags: OpFlags,
-    /// 预留字段，保持固定 ABI 大小。
-    pub reserved: [u32; 15],
-}
-
 /// GLU 参数。
 ///
-/// v1 仅支持 `OP_SWIGLU`，用于 llama.cpp `ggml_swiglu_split`。
+/// 当前仅支持 `OP_SWIGLU`。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct GluAttr {
-    /// GLU 变体编号，对齐 ggml `enum ggml_glu_op`。
+    /// GLU 变体编号。
     pub op: u32,
     /// 非零表示无第二输入时交换 src0 的左右半区。
     pub swapped: u32,
@@ -233,7 +202,7 @@ pub struct UnaryAttr {
 /// - tensors[0] = input
 /// - tensors[1] = weight
 /// - tensors[2] = output
-/// - tensors[3] = bias/quant 参数，可选
+/// - tensors[3] = bias 参数，可选
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Conv2dAttr {
@@ -485,8 +454,6 @@ impl ReduceMaxAttr {
 impl BinaryAttr {
     /// MOD 使用浮点 fmod 语义的 flag。
     pub const MOD_FMOD: u32 = 1 << 0;
-    /// GGML 广播语义：一维权重沿最后逻辑维广播。
-    pub const BROADCAST_GGML_LAST_DIM: u32 = 1;
 }
 
 impl SoftmaxAttr {
@@ -495,7 +462,7 @@ impl SoftmaxAttr {
 }
 
 impl GluAttr {
-    /// 对齐 ggml `GGML_GLU_OP_SWIGLU`。
+    /// SwiGLU split 变体。
     pub const OP_SWIGLU: u32 = 2;
 }
 
@@ -520,14 +487,6 @@ impl AiKernelAttr for RopeAttr {
 
 impl AiKernelAttr for SoftmaxAttr {
     const OP: KernelOp = KernelOp::SOFTMAX;
-}
-
-impl AiKernelAttr for GetRowsAttr {
-    const OP: KernelOp = KernelOp::GET_ROWS;
-}
-
-impl AiKernelAttr for SetRowsAttr {
-    const OP: KernelOp = KernelOp::SET_ROWS;
 }
 
 impl AiKernelAttr for GluAttr {
@@ -593,8 +552,6 @@ const _: () = assert!(core::mem::size_of::<RmsNormAttr>() == 64);
 const _: () = assert!(core::mem::size_of::<RopeAttr>() == 64);
 const _: () = assert!(core::mem::size_of::<SoftmaxAttr>() == 64);
 const _: () = assert!(core::mem::size_of::<BinaryAttr>() == 64);
-const _: () = assert!(core::mem::size_of::<GetRowsAttr>() == 64);
-const _: () = assert!(core::mem::size_of::<SetRowsAttr>() == 64);
 const _: () = assert!(core::mem::size_of::<GluAttr>() == 64);
 const _: () = assert!(core::mem::size_of::<CopyAttr>() == 64);
 const _: () = assert!(core::mem::size_of::<UnaryAttr>() == 64);
@@ -689,18 +646,6 @@ mod abi_layout {
         beta: f32,
         flags: u32,
         reserved: [u32; 12],
-    }
-
-    #[repr(C)]
-    struct RawGetRowsAttr {
-        flags: u32,
-        reserved: [u32; 15],
-    }
-
-    #[repr(C)]
-    struct RawSetRowsAttr {
-        flags: u32,
-        reserved: [u32; 15],
     }
 
     #[repr(C)]
@@ -901,8 +846,6 @@ mod abi_layout {
         RawBinaryAttr,
         [broadcast_kind, alpha, beta, flags, reserved]
     );
-    assert_attr_layout!(GetRowsAttr, RawGetRowsAttr, [flags, reserved]);
-    assert_attr_layout!(SetRowsAttr, RawSetRowsAttr, [flags, reserved]);
     assert_attr_layout!(GluAttr, RawGluAttr, [op, swapped, flags, reserved]);
     assert_attr_layout!(CopyAttr, RawCopyAttr, [flags, reserved]);
     assert_attr_layout!(UnaryAttr, RawUnaryAttr, [alpha, beta, flags, reserved]);

@@ -10,7 +10,7 @@
 extern crate alloc;
 
 use k3_ai_uabi::error::BackendErr;
-use k3_ai_uabi::{AiGraphNode, KernelOp, MAX_SUBMIT_TENSORS};
+use k3_ai_uabi::{AiGraphNode, AiTargetHint, KernelOp, MAX_SUBMIT_TENSORS};
 use log::{error, info};
 
 pub mod binary;
@@ -18,12 +18,27 @@ pub mod call;
 pub mod conv2d;
 pub mod matmul;
 pub mod nn;
-pub mod quant;
 mod rvv;
 pub mod transform;
 pub mod unary;
 
 pub use call::{BackendCall, BackendTensorView};
+
+/// 一个静态可分发的 backend 算子。
+///
+/// 实现者把一个固定的 [`KernelOp`] 映射到其 ABI 调用入口；注册表和动态分发不属于
+/// backend ABI。调用方必须满足 [`BackendCall`] 中指针、长度和生命周期约束。
+pub trait ComputeKernel {
+    /// 此实现处理的 ABI 操作码。
+    const OP: KernelOp;
+
+    /// 解析并执行一次 backend 调用。
+    ///
+    /// # Safety
+    ///
+    /// `call` 及其 tensor/attr 指针必须在调用期间保持有效，并符合 `BackendCall` ABI。
+    unsafe fn call(call: *const BackendCall) -> Result<(), BackendErr>;
+}
 
 /// 内核入口,tensor地址需要已经映射
 /// backend 算子分发入口，按 `call.op` 路由到对应算子执行器。
@@ -78,7 +93,8 @@ pub unsafe extern "C" fn k3_run_kernel(node: &mut AiGraphNode) -> i32 {
 
     let call = BackendCall {
         op: desc.op,
-        target: desc.target_hint.0,
+        // TODO: X100 bring-up 完成后恢复使用调度器传入的 target hint。
+        target: AiTargetHint::PREFER_X100.0,
         inputs: input_views.as_ptr(),
         input_count: desc.input_count,
         outputs: output_views.as_mut_ptr(),
@@ -93,34 +109,36 @@ pub unsafe extern "C" fn k3_run_kernel(node: &mut AiGraphNode) -> i32 {
     );
 
     let result = match desc.op {
-        KernelOp::MAT_MUL => unsafe { matmul::matmul_caller(&call) },
-        KernelOp::SILU => unsafe { unary::unary_caller(&call, unary::UnaryKind::Silu) },
-        KernelOp::SIGMOID => unsafe { unary::unary_caller(&call, unary::UnaryKind::Sigmoid) },
-        KernelOp::SCALE => unsafe { unary::unary_caller(&call, unary::UnaryKind::Scale) },
-        KernelOp::ADD => unsafe { binary::binary_caller(&call, binary::BinaryKind::Add) },
-        KernelOp::MUL => unsafe { binary::binary_caller(&call, binary::BinaryKind::Mul) },
-        KernelOp::SUB => unsafe { binary::binary_caller(&call, binary::BinaryKind::Sub) },
-        KernelOp::DIV => unsafe { binary::binary_caller(&call, binary::BinaryKind::Div) },
-        KernelOp::MOD => unsafe { binary::binary_caller(&call, binary::BinaryKind::Mod) },
-        KernelOp::CONV2D => unsafe { conv2d::conv2d_caller(&call) },
-        KernelOp::RMS_NORM => unsafe { nn::rms_norm_caller(&call) },
-        KernelOp::ROPE => unsafe { nn::rope_caller(&call) },
-        KernelOp::SOFTMAX => unsafe { nn::softmax_caller(&call) },
-        KernelOp::GLU => unsafe { nn::glu_caller(&call) },
-        KernelOp::MAX_POOL => unsafe { nn::max_pool_caller(&call) },
-        KernelOp::REDUCE_MAX => unsafe { nn::reduce_max_caller(&call) },
-        KernelOp::TOP_K => unsafe { nn::top_k_caller(&call) },
-        KernelOp::CONCAT => unsafe { transform::concat_caller(&call) },
-        KernelOp::TRANSPOSE => unsafe { transform::transpose_caller(&call) },
-        KernelOp::GATHER => unsafe { transform::gather_caller(&call) },
-        KernelOp::GATHER_ELEMENTS => unsafe { transform::gather_elements_caller(&call) },
-        KernelOp::GET_ROWS => unsafe { transform::get_rows_caller(&call) },
-        KernelOp::SET_ROWS => unsafe { transform::set_rows_caller(&call) },
-        KernelOp::COPY => unsafe { transform::copy_caller(&call) },
-        KernelOp::CAST => unsafe { transform::cast_caller(&call) },
-        KernelOp::RESIZE => unsafe { transform::resize_caller(&call) },
-        KernelOp::EXPAND => unsafe { transform::expand_caller(&call) },
-        KernelOp::TILE => unsafe { transform::tile_caller(&call) },
+        KernelOp::MAT_MUL => unsafe { <matmul::MatMulKernel as ComputeKernel>::call(&call) },
+        KernelOp::SILU => unsafe { <unary::SiluKernel as ComputeKernel>::call(&call) },
+        KernelOp::SIGMOID => unsafe { <unary::SigmoidKernel as ComputeKernel>::call(&call) },
+        KernelOp::SCALE => unsafe { <unary::ScaleKernel as ComputeKernel>::call(&call) },
+        KernelOp::ADD => unsafe { <binary::AddKernel as ComputeKernel>::call(&call) },
+        KernelOp::MUL => unsafe { <binary::MulKernel as ComputeKernel>::call(&call) },
+        KernelOp::SUB => unsafe { <binary::SubKernel as ComputeKernel>::call(&call) },
+        KernelOp::DIV => unsafe { <binary::DivKernel as ComputeKernel>::call(&call) },
+        KernelOp::MOD => unsafe { <binary::ModKernel as ComputeKernel>::call(&call) },
+        KernelOp::CONV2D => unsafe { <conv2d::Conv2dKernel as ComputeKernel>::call(&call) },
+        KernelOp::RMS_NORM => unsafe { <nn::RmsNormKernel as ComputeKernel>::call(&call) },
+        KernelOp::ROPE => unsafe { <nn::RopeKernel as ComputeKernel>::call(&call) },
+        KernelOp::SOFTMAX => unsafe { <nn::SoftmaxKernel as ComputeKernel>::call(&call) },
+        KernelOp::GLU => unsafe { <nn::GluKernel as ComputeKernel>::call(&call) },
+        KernelOp::MAX_POOL => unsafe { <nn::MaxPoolKernel as ComputeKernel>::call(&call) },
+        KernelOp::REDUCE_MAX => unsafe { <nn::ReduceMaxKernel as ComputeKernel>::call(&call) },
+        KernelOp::TOP_K => unsafe { <nn::TopKKernel as ComputeKernel>::call(&call) },
+        KernelOp::CONCAT => unsafe { <transform::ConcatKernel as ComputeKernel>::call(&call) },
+        KernelOp::TRANSPOSE => unsafe {
+            <transform::TransposeKernel as ComputeKernel>::call(&call)
+        },
+        KernelOp::GATHER => unsafe { <transform::GatherKernel as ComputeKernel>::call(&call) },
+        KernelOp::GATHER_ELEMENTS => unsafe {
+            <transform::GatherElementsKernel as ComputeKernel>::call(&call)
+        },
+        KernelOp::COPY => unsafe { <transform::CopyKernel as ComputeKernel>::call(&call) },
+        KernelOp::CAST => unsafe { <transform::CastKernel as ComputeKernel>::call(&call) },
+        KernelOp::RESIZE => unsafe { <transform::ResizeKernel as ComputeKernel>::call(&call) },
+        KernelOp::EXPAND => unsafe { <transform::ExpandKernel as ComputeKernel>::call(&call) },
+        KernelOp::TILE => unsafe { <transform::TileKernel as ComputeKernel>::call(&call) },
         _ => Err(BackendErr::UnsupportedOp),
     };
 
@@ -143,6 +161,69 @@ pub unsafe extern "C" fn k3_run_kernel(node: &mut AiGraphNode) -> i32 {
 mod tests {
     use super::*;
     use k3_ai_uabi::TensorCount;
+
+    /// 所有保留操作码都必须静态绑定到对应 marker，而不是经由运行时注册表。
+    #[test]
+    fn static_markers_cover_all_preserved_ops() {
+        assert_eq!(
+            <matmul::MatMulKernel as ComputeKernel>::OP,
+            KernelOp::MAT_MUL
+        );
+        assert_eq!(
+            <conv2d::Conv2dKernel as ComputeKernel>::OP,
+            KernelOp::CONV2D
+        );
+        assert_eq!(<binary::AddKernel as ComputeKernel>::OP, KernelOp::ADD);
+        assert_eq!(<binary::MulKernel as ComputeKernel>::OP, KernelOp::MUL);
+        assert_eq!(<binary::SubKernel as ComputeKernel>::OP, KernelOp::SUB);
+        assert_eq!(<binary::DivKernel as ComputeKernel>::OP, KernelOp::DIV);
+        assert_eq!(<binary::ModKernel as ComputeKernel>::OP, KernelOp::MOD);
+        assert_eq!(<unary::SiluKernel as ComputeKernel>::OP, KernelOp::SILU);
+        assert_eq!(
+            <unary::SigmoidKernel as ComputeKernel>::OP,
+            KernelOp::SIGMOID
+        );
+        assert_eq!(<unary::ScaleKernel as ComputeKernel>::OP, KernelOp::SCALE);
+        assert_eq!(<nn::SoftmaxKernel as ComputeKernel>::OP, KernelOp::SOFTMAX);
+        assert_eq!(<nn::RmsNormKernel as ComputeKernel>::OP, KernelOp::RMS_NORM);
+        assert_eq!(<nn::RopeKernel as ComputeKernel>::OP, KernelOp::ROPE);
+        assert_eq!(<nn::GluKernel as ComputeKernel>::OP, KernelOp::GLU);
+        assert_eq!(<nn::MaxPoolKernel as ComputeKernel>::OP, KernelOp::MAX_POOL);
+        assert_eq!(
+            <nn::ReduceMaxKernel as ComputeKernel>::OP,
+            KernelOp::REDUCE_MAX
+        );
+        assert_eq!(<nn::TopKKernel as ComputeKernel>::OP, KernelOp::TOP_K);
+        assert_eq!(
+            <transform::ConcatKernel as ComputeKernel>::OP,
+            KernelOp::CONCAT
+        );
+        assert_eq!(
+            <transform::TransposeKernel as ComputeKernel>::OP,
+            KernelOp::TRANSPOSE
+        );
+        assert_eq!(
+            <transform::GatherKernel as ComputeKernel>::OP,
+            KernelOp::GATHER
+        );
+        assert_eq!(
+            <transform::GatherElementsKernel as ComputeKernel>::OP,
+            KernelOp::GATHER_ELEMENTS
+        );
+        assert_eq!(<transform::CopyKernel as ComputeKernel>::OP, KernelOp::COPY);
+        assert_eq!(<transform::CastKernel as ComputeKernel>::OP, KernelOp::CAST);
+        assert_eq!(
+            <transform::ResizeKernel as ComputeKernel>::OP,
+            KernelOp::RESIZE
+        );
+        assert_eq!(
+            <transform::ExpandKernel as ComputeKernel>::OP,
+            KernelOp::EXPAND
+        );
+        assert_eq!(<transform::TileKernel as ComputeKernel>::OP, KernelOp::TILE);
+        assert!(!KernelOp(25).is_known());
+        assert!(!KernelOp(26).is_known());
+    }
 
     /// tensor 总数超限时应在解引用数组前就拒绝并返回 -1。
     #[test]

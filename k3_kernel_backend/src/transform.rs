@@ -1,29 +1,78 @@
 //! Tensor 搬运、索引与 shape 变换算子。
 
-use crate::BackendCall;
 use crate::call::{CallContext, TensorMeta, normalize_axis};
-use crate::quant;
 use crate::rvv::{self, BinaryOp};
+use crate::{BackendCall, ComputeKernel};
 use alloc::vec;
 use alloc::vec::Vec;
 use half::f16;
 use k3_ai_uabi::error::BackendErr;
 use k3_ai_uabi::{
     AiDtype, AiTargetHint, CastAttr, ConcatAttr, CopyAttr, ExpandAttr, GatherAttr,
-    GatherElementsAttr, GetRowsAttr, MAX_DIM, Resize2dAttr, SetRowsAttr, TileAttr, TransposeAttr,
+    GatherElementsAttr, KernelOp, MAX_DIM, Resize2dAttr, TileAttr, TransposeAttr,
 };
 use log::warn;
+
+/// Concat 的静态分发标记。
+pub(crate) struct ConcatKernel;
+/// Transpose 的静态分发标记。
+pub(crate) struct TransposeKernel;
+/// Gather 的静态分发标记。
+pub(crate) struct GatherKernel;
+/// GatherElements 的静态分发标记。
+pub(crate) struct GatherElementsKernel;
+/// Copy 的静态分发标记。
+pub(crate) struct CopyKernel;
+/// Cast 的静态分发标记。
+pub(crate) struct CastKernel;
+/// Resize 的静态分发标记。
+pub(crate) struct ResizeKernel;
+/// Expand 的静态分发标记。
+pub(crate) struct ExpandKernel;
+/// Tile 的静态分发标记。
+pub(crate) struct TileKernel;
+
+macro_rules! impl_transform_kernel {
+    ($marker:ident, $op:expr, $entry:ident) => {
+        impl ComputeKernel for $marker {
+            const OP: KernelOp = $op;
+
+            unsafe fn call(call: *const BackendCall) -> Result<(), BackendErr> {
+                unsafe { $entry(call) }
+            }
+        }
+    };
+}
+
+impl_transform_kernel!(ConcatKernel, KernelOp::CONCAT, call_concat);
+impl_transform_kernel!(TransposeKernel, KernelOp::TRANSPOSE, call_transpose);
+impl_transform_kernel!(GatherKernel, KernelOp::GATHER, call_gather);
+impl_transform_kernel!(
+    GatherElementsKernel,
+    KernelOp::GATHER_ELEMENTS,
+    call_gather_elements
+);
+impl_transform_kernel!(CopyKernel, KernelOp::COPY, call_copy);
+impl_transform_kernel!(CastKernel, KernelOp::CAST, call_cast);
+impl_transform_kernel!(ResizeKernel, KernelOp::RESIZE, call_resize);
+impl_transform_kernel!(ExpandKernel, KernelOp::EXPAND, call_expand);
+impl_transform_kernel!(TileKernel, KernelOp::TILE, call_tile);
 
 /// Concat 调用入口。
 ///
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn concat_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_concat(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io_range(1..=7, 1..=1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<ConcatAttr>()?;
+    if ctx.outputs[0].dtype != AiDtype::F16
+        || ctx.inputs.iter().any(|view| view.dtype != AiDtype::F16)
+    {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let output_meta = ctx.outputs[0].checked_meta()?;
     let axis = normalize_axis(attr.axis, output_meta.rank)?;
     let dtype = ctx.outputs[0].dtype;
@@ -125,11 +174,14 @@ pub(crate) unsafe fn concat_caller(call: *const BackendCall) -> Result<(), Backe
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn transpose_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_transpose(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<TransposeAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     if ctx.inputs[0].dtype != ctx.outputs[0].dtype
@@ -182,11 +234,14 @@ pub(crate) unsafe fn transpose_caller(call: *const BackendCall) -> Result<(), Ba
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn gather_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_gather(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(2, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<GatherAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let data_meta = ctx.inputs[0].checked_meta()?;
     let indices_meta = ctx.inputs[1].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
@@ -251,11 +306,14 @@ pub(crate) unsafe fn gather_caller(call: *const BackendCall) -> Result<(), Backe
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn gather_elements_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_gather_elements(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(2, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<GatherElementsAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let data_meta = ctx.inputs[0].checked_meta()?;
     let indices_meta = ctx.inputs[1].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
@@ -293,145 +351,18 @@ pub(crate) unsafe fn gather_elements_caller(call: *const BackendCall) -> Result<
     write_logical_bytes(&logical_output, output, &output_meta, ctx.target)
 }
 
-/// GGML GetRows 调用入口。
-///
-/// # Safety
-///
-/// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn get_rows_caller(call: *const BackendCall) -> Result<(), BackendErr> {
-    let ctx = unsafe { CallContext::from_call(call)? };
-    ctx.expect_io(2, 1)?;
-    ctx.reject_input_output_alias()?;
-    let attr = ctx.read_attr::<GetRowsAttr>()?;
-    if attr.flags.get() != 0 {
-        return Err(BackendErr::InvalidAttr);
-    }
-
-    let indices_meta = ctx.inputs[1].checked_meta()?;
-    let output_meta = ctx.outputs[0].checked_meta()?;
-    let indices = read_indices(&ctx.inputs[1], &indices_meta)?;
-    if output_meta.rank != 4 || indices_meta.rank > 4 {
-        return Err(BackendErr::InvalidTensor);
-    }
-
-    let data_dtype = ctx.inputs[0].dtype;
-    if !matches!(ctx.outputs[0].dtype, AiDtype::F32 | AiDtype::F16) {
-        return Err(BackendErr::UnsupportedDtype);
-    }
-
-    let mut output = vec![0.0_f32; output_meta.element_count];
-    if data_dtype.is_ggml_quant() {
-        let data_meta = ctx.inputs[0].checked_quant_meta()?;
-        validate_get_rows_shapes(
-            data_meta.rank,
-            &data_meta.shape,
-            &indices_meta,
-            &output_meta,
-        )?;
-        for linear in 0..output_meta.element_count {
-            let mut out_coordinates = [0_usize; MAX_DIM];
-            output_meta.coordinates(linear, &mut out_coordinates)?;
-            let row_index = get_rows_index(&indices, &indices_meta, &out_coordinates)?;
-            let mut data_coordinates = [0_usize; MAX_DIM];
-            data_coordinates[0] = out_coordinates[0];
-            data_coordinates[1] = row_index;
-            data_coordinates[2..4].copy_from_slice(&out_coordinates[2..4]);
-            output[linear] = quant::read_quant_f32(&ctx.inputs[0], &data_meta, &data_coordinates)?;
-        }
-    } else {
-        let data_meta = ctx.inputs[0].checked_meta()?;
-        validate_get_rows_shapes(
-            data_meta.rank,
-            &data_meta.shape,
-            &indices_meta,
-            &output_meta,
-        )?;
-        for linear in 0..output_meta.element_count {
-            let mut out_coordinates = [0_usize; MAX_DIM];
-            output_meta.coordinates(linear, &mut out_coordinates)?;
-            let row_index = get_rows_index(&indices, &indices_meta, &out_coordinates)?;
-            let mut data_coordinates = [0_usize; MAX_DIM];
-            data_coordinates[0] = out_coordinates[0];
-            data_coordinates[1] = row_index;
-            data_coordinates[2..4].copy_from_slice(&out_coordinates[2..4]);
-            output[linear] = read_dense_f32(&ctx.inputs[0], &data_meta, &data_coordinates)?;
-        }
-    }
-    write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
-}
-
-/// GGML SetRows 调用入口。
-///
-/// # Safety
-///
-/// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn set_rows_caller(call: *const BackendCall) -> Result<(), BackendErr> {
-    let ctx = unsafe { CallContext::from_call(call)? };
-    ctx.expect_io(3, 1)?;
-    let attr = ctx.read_attr::<SetRowsAttr>()?;
-    if attr.flags.get() != 0 {
-        return Err(BackendErr::InvalidAttr);
-    }
-
-    let source_meta = ctx.inputs[0].checked_meta()?;
-    let indices_meta = ctx.inputs[1].checked_meta()?;
-    let dest_meta = ctx.inputs[2].checked_meta()?;
-    let output_meta = ctx.outputs[0].checked_meta()?;
-    if ctx.inputs[0].dtype != AiDtype::F32
-        || !matches!(ctx.outputs[0].dtype, AiDtype::F32 | AiDtype::F16)
-        || ctx.inputs[2].dtype != ctx.outputs[0].dtype
-        || source_meta.rank != 4
-        || dest_meta.rank != 4
-        || output_meta.rank != 4
-        || dest_meta.shape[..4] != output_meta.shape[..4]
-        || source_meta.shape[0] != dest_meta.shape[0]
-        || source_meta.shape[2] != dest_meta.shape[2]
-        || source_meta.shape[3] != dest_meta.shape[3]
-    {
-        return Err(BackendErr::InvalidTensor);
-    }
-
-    let indices = read_indices(&ctx.inputs[1], &indices_meta)?;
-    let mut output = read_float_tensor(&ctx.inputs[2], &dest_meta, ctx.target)?;
-    let nc = source_meta.shape[0];
-    let nr = source_meta.shape[1];
-    for i3 in 0..source_meta.shape[3] {
-        for i2 in 0..source_meta.shape[2] {
-            for i in 0..nr {
-                let row_index = set_rows_index(&indices, &indices_meta, i, i2, i3)?;
-                if row_index >= dest_meta.shape[1] {
-                    return Err(BackendErr::InvalidInput);
-                }
-                for col in 0..nc {
-                    let mut source_coordinates = [0_usize; MAX_DIM];
-                    source_coordinates[0] = col;
-                    source_coordinates[1] = i;
-                    source_coordinates[2] = i2;
-                    source_coordinates[3] = i3;
-                    let value = read_dense_f32(&ctx.inputs[0], &source_meta, &source_coordinates)?;
-                    let mut output_coordinates = [0_usize; MAX_DIM];
-                    output_coordinates[0] = col;
-                    output_coordinates[1] = row_index;
-                    output_coordinates[2] = i2;
-                    output_coordinates[3] = i3;
-                    let output_linear = row_major_linear(&output_meta, &output_coordinates)?;
-                    output[output_linear] = value;
-                }
-            }
-        }
-    }
-    write_float_tensor(&output, &mut ctx.outputs[0], &output_meta, ctx.target)
-}
-
 /// Materialize/copy one tensor into another.
 ///
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn copy_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_copy(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 1)?;
     let attr = ctx.read_attr::<CopyAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     if attr.flags.get() != 0 {
         return Err(BackendErr::InvalidAttr);
     }
@@ -451,100 +382,19 @@ pub(crate) unsafe fn copy_caller(call: *const BackendCall) -> Result<(), Backend
     write_logical_bytes(&logical, output, &output_meta, ctx.target)
 }
 
-/// Validate ggml get_rows shape relation.
-fn validate_get_rows_shapes(
-    data_rank: usize,
-    data_shape: &[usize; MAX_DIM],
-    indices_meta: &TensorMeta,
-    output_meta: &TensorMeta,
-) -> Result<(), BackendErr> {
-    let data_dim = |axis| dim_or_one(data_shape, data_rank, axis);
-    let index_dim = |axis| dim_or_one(&indices_meta.shape, indices_meta.rank, axis);
-    if data_rank > 4
-        || indices_meta.rank > 4
-        || output_meta.rank != 4
-        || output_meta.shape[0] != data_dim(0)
-        || output_meta.shape[1] != index_dim(0)
-        || output_meta.shape[2] != index_dim(1)
-        || output_meta.shape[3] != index_dim(2)
-        || data_dim(2) != index_dim(1)
-        || data_dim(3) != index_dim(2)
-    {
-        return Err(BackendErr::InvalidTensor);
-    }
-    Ok(())
-}
-
-/// Return a shape dimension, treating missing ggml high dimensions as 1.
-fn dim_or_one(shape: &[usize; MAX_DIM], rank: usize, axis: usize) -> usize {
-    if axis < rank { shape[axis] } else { 1 }
-}
-
-/// Resolve get_rows row index for an output coordinate.
-fn get_rows_index(
-    indices: &[i64],
-    indices_meta: &TensorMeta,
-    output_coordinates: &[usize; MAX_DIM],
-) -> Result<usize, BackendErr> {
-    let mut index_coordinates = [0_usize; MAX_DIM];
-    index_coordinates[0] = output_coordinates[1];
-    index_coordinates[1] = output_coordinates[2];
-    index_coordinates[2] = output_coordinates[3];
-    let linear = row_major_linear(indices_meta, &index_coordinates)?;
-    usize::try_from(indices[linear]).map_err(|_| BackendErr::InvalidInput)
-}
-
-/// Resolve set_rows destination row index for source row and batch coordinates.
-fn set_rows_index(
-    indices: &[i64],
-    indices_meta: &TensorMeta,
-    row: usize,
-    i2: usize,
-    i3: usize,
-) -> Result<usize, BackendErr> {
-    if row >= dim_or_one(&indices_meta.shape, indices_meta.rank, 0) {
-        return Err(BackendErr::InvalidTensor);
-    }
-    let idx1 = i2 % dim_or_one(&indices_meta.shape, indices_meta.rank, 1);
-    let idx2 = i3 % dim_or_one(&indices_meta.shape, indices_meta.rank, 2);
-    let mut coordinates = [0_usize; MAX_DIM];
-    coordinates[0] = row;
-    coordinates[1] = idx1;
-    coordinates[2] = idx2;
-    let linear = row_major_linear(indices_meta, &coordinates)?;
-    usize::try_from(indices[linear]).map_err(|_| BackendErr::InvalidInput)
-}
-
-/// Read one dense F32/F16 tensor scalar as f32.
-fn read_dense_f32(
-    view: &crate::BackendTensorView,
-    meta: &TensorMeta,
-    coordinates: &[usize; MAX_DIM],
-) -> Result<f32, BackendErr> {
-    let offset = meta.offset_for_coordinates(coordinates)?;
-    match view.dtype {
-        AiDtype::F32 => {
-            let values = unsafe { view.as_slice::<f32>()? };
-            Ok(values[offset])
-        }
-        AiDtype::F16 => {
-            let values = unsafe { view.as_slice::<u16>()? };
-            Ok(f16::from_bits(values[offset]).to_f32())
-        }
-        _ => Err(BackendErr::UnsupportedDtype),
-    }
-}
-
 /// Expand 调用入口。
 ///
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn expand_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_expand(call: *const BackendCall) -> Result<(), BackendErr> {
     let mut ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<ExpandAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     if ctx.inputs[0].dtype != ctx.outputs[0].dtype
@@ -586,11 +436,14 @@ pub(crate) unsafe fn expand_caller(call: *const BackendCall) -> Result<(), Backe
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn tile_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_tile(call: *const BackendCall) -> Result<(), BackendErr> {
     let mut ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<TileAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     if ctx.inputs[0].dtype != ctx.outputs[0].dtype
@@ -623,11 +476,20 @@ pub(crate) unsafe fn tile_caller(call: *const BackendCall) -> Result<(), Backend
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn cast_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_cast(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<CastAttr>()?;
+    if !matches!(
+        ctx.inputs[0].dtype,
+        AiDtype::F16 | AiDtype::I32 | AiDtype::I64
+    ) || !matches!(
+        ctx.outputs[0].dtype,
+        AiDtype::F16 | AiDtype::I32 | AiDtype::I64
+    ) {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     if attr.to != ctx.outputs[0].dtype
@@ -654,11 +516,14 @@ pub(crate) unsafe fn cast_caller(call: *const BackendCall) -> Result<(), Backend
 /// # Safety
 ///
 /// `call` 及 tensor buffer 必须满足 backend ABI 生命周期约束。
-pub(crate) unsafe fn resize_caller(call: *const BackendCall) -> Result<(), BackendErr> {
+unsafe fn call_resize(call: *const BackendCall) -> Result<(), BackendErr> {
     let ctx = unsafe { CallContext::from_call(call)? };
     ctx.expect_io(1, 1)?;
     ctx.reject_input_output_alias()?;
     let attr = ctx.read_attr::<Resize2dAttr>()?;
+    if ctx.inputs[0].dtype != AiDtype::F16 || ctx.outputs[0].dtype != AiDtype::F16 {
+        return Err(BackendErr::UnsupportedDtype);
+    }
     let input_meta = ctx.inputs[0].checked_meta()?;
     let output_meta = ctx.outputs[0].checked_meta()?;
     if input_meta.rank != 4
@@ -681,7 +546,8 @@ pub(crate) unsafe fn resize_caller(call: *const BackendCall) -> Result<(), Backe
     }
 
     let logical_input = read_float_tensor(&ctx.inputs[0], &input_meta, ctx.target)?;
-    let logical_output = resize_f32(&logical_input, &input_meta, &output_meta, &attr, ctx.target)?;
+    let logical_output =
+        compute_f16_resize(&logical_input, &input_meta, &output_meta, &attr, ctx.target)?;
     write_float_tensor(
         &logical_output,
         &mut ctx.outputs[0],
@@ -728,9 +594,9 @@ pub(crate) fn read_logical_bytes(
         .element_count
         .checked_mul(meta.element_size)
         .ok_or(BackendErr::InvalidTensor)?;
-        // 本来就连续的话就直接返回
+    // 本来就连续的话就直接返回
     if meta.is_contiguous() {
-            return raw
+        return raw
             .get(..logical_len)
             .ok_or(BackendErr::InvalidTensor)
             .map(<[u8]>::to_vec);
@@ -889,36 +755,11 @@ fn cast_logical(
     input_dtype: AiDtype,
     output_dtype: AiDtype,
     count: usize,
-    target: AiTargetHint,
+    _target: AiTargetHint,
 ) -> Result<Vec<u8>, BackendErr> {
     if input_dtype == output_dtype {
         return Ok(input.to_vec());
     }
-    if input_dtype == AiDtype::I32 && output_dtype == AiDtype::F32 {
-        let values = bytes_as_i32(input)?;
-        let mut converted = vec![0.0_f32; count];
-        if vector_target(target) {
-            rvv::cast_i32_to_f32(&values, &mut converted)?;
-        } else {
-            for (dst, src) in converted.iter_mut().zip(values) {
-                *dst = src as f32;
-            }
-        }
-        return Ok(f32_as_bytes(&converted));
-    }
-    if input_dtype == AiDtype::F32 && output_dtype == AiDtype::I32 {
-        let values = bytes_as_f32(input)?;
-        let mut converted = vec![0_i32; count];
-        if vector_target(target) {
-            rvv::cast_f32_to_i32(&values, &mut converted)?;
-        } else {
-            for (dst, src) in converted.iter_mut().zip(values) {
-                *dst = src as i32;
-            }
-        }
-        return Ok(i32_as_bytes(&converted));
-    }
-
     let mut output = vec![0_u8; count * dtype_size(output_dtype)?];
     for index in 0..count {
         let value = read_scalar(input, input_dtype, index)?;
@@ -934,34 +775,24 @@ enum ScalarValue {
     Float(f32),
     /// 有符号整数值。
     Signed(i64),
-    /// 无符号整数值。
-    Unsigned(u64),
-    /// 布尔值。
-    Bool(bool),
 }
 
 /// 从逻辑字节读取一个标量。
 fn read_scalar(bytes: &[u8], dtype: AiDtype, index: usize) -> Result<ScalarValue, BackendErr> {
     let offset = index * dtype_size(dtype)?;
     Ok(match dtype {
-        AiDtype::F32 => ScalarValue::Float(f32::from_ne_bytes(
-            bytes[offset..offset + 4].try_into().unwrap(),
-        )),
         AiDtype::F16 => ScalarValue::Float(
             f16::from_bits(u16::from_ne_bytes(
                 bytes[offset..offset + 2].try_into().unwrap(),
             ))
             .to_f32(),
         ),
-        AiDtype::I8 => ScalarValue::Signed(bytes[offset] as i8 as i64),
-        AiDtype::U8 => ScalarValue::Unsigned(bytes[offset] as u64),
         AiDtype::I32 => ScalarValue::Signed(i32::from_ne_bytes(
             bytes[offset..offset + 4].try_into().unwrap(),
         ) as i64),
         AiDtype::I64 => ScalarValue::Signed(i64::from_ne_bytes(
             bytes[offset..offset + 8].try_into().unwrap(),
         )),
-        AiDtype::BOOL => ScalarValue::Bool(bytes[offset] != 0),
         _ => return Err(BackendErr::UnsupportedDtype),
     })
 }
@@ -977,24 +808,16 @@ fn write_scalar(
     let as_f32 = match value {
         ScalarValue::Float(value) => value,
         ScalarValue::Signed(value) => value as f32,
-        ScalarValue::Unsigned(value) => value as f32,
-        ScalarValue::Bool(value) => u8::from(value) as f32,
     };
     let as_i64 = match value {
         ScalarValue::Float(value) => value as i64,
         ScalarValue::Signed(value) => value,
-        ScalarValue::Unsigned(value) => value as i64,
-        ScalarValue::Bool(value) => i64::from(value),
     };
     match dtype {
-        AiDtype::F32 => bytes[offset..offset + 4].copy_from_slice(&as_f32.to_ne_bytes()),
         AiDtype::F16 => bytes[offset..offset + 2]
             .copy_from_slice(&f16::from_f32(as_f32).to_bits().to_ne_bytes()),
-        AiDtype::I8 => bytes[offset] = as_i64 as i8 as u8,
-        AiDtype::U8 => bytes[offset] = as_i64 as u8,
         AiDtype::I32 => bytes[offset..offset + 4].copy_from_slice(&(as_i64 as i32).to_ne_bytes()),
         AiDtype::I64 => bytes[offset..offset + 8].copy_from_slice(&as_i64.to_ne_bytes()),
-        AiDtype::BOOL => bytes[offset] = u8::from(as_f32 != 0.0),
         _ => return Err(BackendErr::UnsupportedDtype),
     }
     Ok(())
@@ -1006,17 +829,6 @@ fn dtype_size(dtype: AiDtype) -> Result<usize, BackendErr> {
         .element_size_bytes()
         .map(|size| size as usize)
         .ok_or(BackendErr::UnsupportedDtype)
-}
-
-/// 从 native-endian 字节构造 I32 Vec。
-fn bytes_as_i32(bytes: &[u8]) -> Result<Vec<i32>, BackendErr> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(BackendErr::InvalidTensor);
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| i32::from_ne_bytes(chunk.try_into().unwrap()))
-        .collect())
 }
 
 /// 从 native-endian 字节构造 F32 Vec。
@@ -1038,15 +850,7 @@ fn f32_as_bytes(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// 把 I32 slice 转成 native-endian 字节。
-fn i32_as_bytes(values: &[i32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| value.to_ne_bytes())
-        .collect()
-}
-
-/// 把 F32/F16 tensor 读取为连续 F32。
+/// 把 F16 tensor 解码成连续 F32 工作缓冲。
 pub(crate) fn read_float_tensor(
     view: &crate::BackendTensorView,
     meta: &TensorMeta,
@@ -1055,7 +859,6 @@ pub(crate) fn read_float_tensor(
     let raw = unsafe { view.as_slice::<u8>()? };
     let logical = read_logical_bytes(raw, meta, target)?;
     match view.dtype {
-        AiDtype::F32 => bytes_as_f32(&logical),
         AiDtype::F16 => Ok(logical
             .chunks_exact(2)
             .map(|chunk| f16::from_bits(u16::from_ne_bytes(chunk.try_into().unwrap())).to_f32())
@@ -1064,15 +867,14 @@ pub(crate) fn read_float_tensor(
     }
 }
 
-/// 把连续 F32 写入 F32/F16 tensor。
+/// 把连续 F32 工作缓冲量化写入 F16 tensor。
 pub(crate) fn write_float_tensor(
     values: &[f32],
     view: &mut crate::BackendTensorView,
     meta: &TensorMeta,
     target: AiTargetHint,
 ) -> Result<(), BackendErr> {
-    let logical = match view.dtype {
-        AiDtype::F32 => f32_as_bytes(values),
+    let logical: Vec<u8> = match view.dtype {
         AiDtype::F16 => values
             .iter()
             .flat_map(|value| f16::from_f32(*value).to_bits().to_ne_bytes())
@@ -1084,7 +886,7 @@ pub(crate) fn write_float_tensor(
 }
 
 /// 执行 NCHW nearest/linear resize。
-fn resize_f32(
+fn compute_f16_resize(
     input: &[f32],
     input_meta: &TensorMeta,
     output_meta: &TensorMeta,
@@ -1156,17 +958,17 @@ fn resize_f32(
         let mut top = vec![0.0_f32; count];
         let mut bottom = vec![0.0_f32; count];
         let mut output = vec![0.0_f32; count];
-        rvv::binary_f32(BinaryOp::Sub, &ones, &wx, &mut one_minus_x)?;
-        rvv::binary_f32(BinaryOp::Sub, &ones, &wy, &mut one_minus_y)?;
-        rvv::binary_f32(BinaryOp::Mul, &p00, &one_minus_x, &mut a)?;
-        rvv::binary_f32(BinaryOp::Mul, &p01, &wx, &mut b)?;
-        rvv::binary_f32(BinaryOp::Add, &a, &b, &mut top)?;
-        rvv::binary_f32(BinaryOp::Mul, &p10, &one_minus_x, &mut a)?;
-        rvv::binary_f32(BinaryOp::Mul, &p11, &wx, &mut b)?;
-        rvv::binary_f32(BinaryOp::Add, &a, &b, &mut bottom)?;
-        rvv::binary_f32(BinaryOp::Mul, &top, &one_minus_y, &mut a)?;
-        rvv::binary_f32(BinaryOp::Mul, &bottom, &wy, &mut b)?;
-        rvv::binary_f32(BinaryOp::Add, &a, &b, &mut output)?;
+        rvv::f16_binary_work(BinaryOp::Sub, &ones, &wx, &mut one_minus_x)?;
+        rvv::f16_binary_work(BinaryOp::Sub, &ones, &wy, &mut one_minus_y)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &p00, &one_minus_x, &mut a)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &p01, &wx, &mut b)?;
+        rvv::f16_binary_work(BinaryOp::Add, &a, &b, &mut top)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &p10, &one_minus_x, &mut a)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &p11, &wx, &mut b)?;
+        rvv::f16_binary_work(BinaryOp::Add, &a, &b, &mut bottom)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &top, &one_minus_y, &mut a)?;
+        rvv::f16_binary_work(BinaryOp::Mul, &bottom, &wy, &mut b)?;
+        rvv::f16_binary_work(BinaryOp::Add, &a, &b, &mut output)?;
         Ok(output)
     } else {
         Ok((0..count)
@@ -1235,11 +1037,11 @@ mod tests {
         }
     }
 
-    /// 以连续 f32 slice 构造后端 tensor view。
-    fn contiguous_f32_view(data: *mut f32, len: usize, shape: &[usize]) -> BackendTensorView {
+    /// 以连续 f16 slice 构造后端 tensor view。
+    fn contiguous_f16_view(data: *mut u16, len: usize, shape: &[usize]) -> BackendTensorView {
         let mut view_shape = [DimSize::new(0); MAX_DIM];
         let mut stride_bytes = [ByteStride::new(0); MAX_DIM];
-        let mut stride = core::mem::size_of::<f32>() as u64;
+        let mut stride = core::mem::size_of::<u16>() as u64;
         for axis in (0..shape.len()).rev() {
             view_shape[axis] = DimSize::new(shape[axis] as u32);
             stride_bytes[axis] = ByteStride::new(stride);
@@ -1247,11 +1049,11 @@ mod tests {
         }
         BackendTensorView {
             data: data.cast::<u8>(),
-            byte_len: ByteSize::new((len * core::mem::size_of::<f32>()) as u64),
+            byte_len: ByteSize::new((len * core::mem::size_of::<u16>()) as u64),
             shape: view_shape,
             stride_bytes,
             ndim: DimCount::new(shape.len() as u32),
-            dtype: AiDtype::F32,
+            dtype: AiDtype::F16,
             layout: AiTensorLayout::DENSE,
             ..BackendTensorView::default()
         }
@@ -1272,17 +1074,39 @@ mod tests {
         assert_eq!(output, [4, 2, 1]);
     }
 
+    /// Gather 索引只接受 I32/I64，且两种 ABI 表示应得到相同逻辑索引。
+    #[test]
+    fn gather_indices_accept_i32_and_i64() {
+        let i32_values = [-1_i32, 2];
+        let i64_values = [-1_i64, 2];
+        let i32_view = BackendTensorView {
+            data: i32_values.as_ptr().cast_mut().cast(),
+            byte_len: ByteSize::new(core::mem::size_of_val(&i32_values) as u64),
+            dtype: AiDtype::I32,
+            ..BackendTensorView::default()
+        };
+        let i64_view = BackendTensorView {
+            data: i64_values.as_ptr().cast_mut().cast(),
+            byte_len: ByteSize::new(core::mem::size_of_val(&i64_values) as u64),
+            dtype: AiDtype::I64,
+            ..BackendTensorView::default()
+        };
+        assert_eq!(read_indices(&i32_view, &meta(&[2], 4)).unwrap(), [-1, 2]);
+        assert_eq!(read_indices(&i64_view, &meta(&[2], 8)).unwrap(), [-1, 2]);
+    }
+
     /// 连续 concat 应直接按每个 batch 的连续 block 复制。
     #[test]
     fn concat_contiguous_copies_axis_blocks() {
-        let c = [1.0_f32, 2.0, 3.0, 4.0];
-        let b = [10.0_f32, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0];
-        let mut y = [0.0_f32; 12];
+        let c = [1.0_f32, 2.0, 3.0, 4.0].map(|value| f16::from_f32(value).to_bits());
+        let b = [10.0_f32, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0]
+            .map(|value| f16::from_f32(value).to_bits());
+        let mut y = [0_u16; 12];
         let inputs = [
-            contiguous_f32_view(c.as_ptr() as *mut f32, c.len(), &[2, 1, 2]),
-            contiguous_f32_view(b.as_ptr() as *mut f32, b.len(), &[2, 2, 2]),
+            contiguous_f16_view(c.as_ptr() as *mut u16, c.len(), &[2, 1, 2]),
+            contiguous_f16_view(b.as_ptr() as *mut u16, b.len(), &[2, 2, 2]),
         ];
-        let mut outputs = [contiguous_f32_view(y.as_mut_ptr(), y.len(), &[2, 3, 2])];
+        let mut outputs = [contiguous_f16_view(y.as_mut_ptr(), y.len(), &[2, 3, 2])];
         let attr = ConcatAttr {
             axis: k3_ai_uabi::TensorAxis::new(1),
             ..ConcatAttr::default()
@@ -1299,33 +1123,39 @@ mod tests {
             attr_size: AttrByteSize::new(attr.len() as u32),
         };
 
-        unsafe { concat_caller(&call) }.unwrap();
+        unsafe { call_concat(&call) }.unwrap();
         assert_eq!(
             y,
             [
                 1.0, 2.0, 10.0, 11.0, 12.0, 13.0, 3.0, 4.0, 20.0, 21.0, 22.0, 23.0
             ]
+            .map(|value| f16::from_f32(value).to_bits())
         );
     }
 
-    /// Cast 应覆盖 F16/F32/I32 常用组合。
+    /// Cast 仅保留 F16 和索引整数间的必要转换。
     #[test]
     fn cast_common_numeric_types() {
-        let input = f32_as_bytes(&[1.5, -2.25]);
-        let half = cast_logical(&input, AiDtype::F32, AiDtype::F16, 2, AiTargetHint::AUTO).unwrap();
-        let restored =
-            cast_logical(&half, AiDtype::F16, AiDtype::F32, 2, AiTargetHint::AUTO).unwrap();
-        let values = bytes_as_f32(&restored).unwrap();
-        assert!((values[0] - 1.5).abs() < 1.0e-3);
+        let input = [
+            f16::from_f32(1.5).to_bits().to_ne_bytes(),
+            f16::from_f32(-2.25).to_bits().to_ne_bytes(),
+        ]
+        .concat();
         let integers = cast_logical(
             &input,
-            AiDtype::F32,
+            AiDtype::F16,
             AiDtype::I32,
             2,
             AiTargetHint::PREFER_A100,
         )
         .unwrap();
-        assert_eq!(bytes_as_i32(&integers).unwrap(), [1, -2]);
+        assert_eq!(
+            integers
+                .chunks_exact(4)
+                .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            [1, -2]
+        );
     }
 
     /// Linear resize 2x2 -> 3x3 的四角应保持不变。
@@ -1342,7 +1172,7 @@ mod tests {
             output_w: k3_ai_uabi::DimSize::new(3),
             ..Resize2dAttr::default()
         };
-        let output = resize_f32(
+        let output = compute_f16_resize(
             &[1.0, 2.0, 3.0, 4.0],
             &input_meta,
             &output_meta,
