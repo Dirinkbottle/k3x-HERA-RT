@@ -32,6 +32,7 @@ pub(crate) struct ExpandKernel;
 /// Tile 的静态分发标记。
 pub(crate) struct TileKernel;
 
+/// Defines a marker that statically routes one tensor transform operator.
 macro_rules! impl_transform_kernel {
     ($marker:ident, $op:expr, $entry:ident) => {
         impl ComputeKernel for $marker {

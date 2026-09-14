@@ -12,21 +12,30 @@ use crate::{BackendCall, ComputeKernel};
 /// 二元算子的语义种类。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BinaryKind {
+    /// Addition.
     Add,
+    /// Multiplication.
     Mul,
+    /// Subtraction.
     Sub,
+    /// Division.
     Div,
+    /// Floating-point remainder.
     Mod,
 }
 
 /// 已校验的 ONNX 右对齐广播计划。
 struct BroadcastPlan {
+    /// Left input metadata.
     lhs: TensorMeta,
+    /// Right input metadata.
     rhs: TensorMeta,
+    /// Output metadata.
     output: TensorMeta,
 }
 
 impl BroadcastPlan {
+    /// Validates and creates a right-aligned broadcast plan.
     fn new(lhs: TensorMeta, rhs: TensorMeta, output: TensorMeta) -> Result<Self, BackendErr> {
         let rank = lhs.rank.max(rhs.rank);
         if output.rank != rank {
@@ -45,6 +54,7 @@ impl BroadcastPlan {
         Ok(Self { lhs, rhs, output })
     }
 
+    /// Resolves one output index to the corresponding three physical offsets.
     fn offsets(&self, linear: usize) -> Result<(usize, usize, usize), BackendErr> {
         let mut output_coordinates = [0_usize; MAX_DIM];
         self.output.coordinates(linear, &mut output_coordinates)?;
@@ -58,6 +68,7 @@ impl BroadcastPlan {
     }
 }
 
+/// Defines a marker that statically routes one binary operator.
 macro_rules! define_binary_kernel {
     ($name:ident, $op:ident, $kind:ident, $doc:literal) => {
         #[doc = $doc]
@@ -163,6 +174,7 @@ fn compute_f16_rvv(
     Ok(())
 }
 
+/// Applies one binary operator in the FP32 accumulation domain.
 fn apply(kind: BinaryKind, attr: BinaryAttr, lhs: u16, rhs: u16) -> Result<f32, BackendErr> {
     let lhs = f16::from_bits(lhs).to_f32();
     let rhs = f16::from_bits(rhs).to_f32();
@@ -178,6 +190,7 @@ fn apply(kind: BinaryKind, attr: BinaryAttr, lhs: u16, rhs: u16) -> Result<f32, 
     }
 }
 
+/// Maps a binary semantic kind to the corresponding RVV primitive.
 fn binary_op(kind: BinaryKind) -> Result<BinaryOp, BackendErr> {
     match kind {
         BinaryKind::Add => Ok(BinaryOp::Add),
@@ -188,6 +201,7 @@ fn binary_op(kind: BinaryKind) -> Result<BinaryOp, BackendErr> {
     }
 }
 
+/// Returns one input dimension after right-aligning it to the output rank.
 fn aligned_dim(meta: &TensorMeta, output_rank: usize, output_axis: usize) -> usize {
     let leading = output_rank - meta.rank;
     if output_axis < leading {
@@ -197,6 +211,7 @@ fn aligned_dim(meta: &TensorMeta, output_rank: usize, output_axis: usize) -> usi
     }
 }
 
+/// Converts output coordinates to an input coordinate under ONNX broadcasting rules.
 fn broadcast_coordinates(
     input: &TensorMeta,
     output: &TensorMeta,

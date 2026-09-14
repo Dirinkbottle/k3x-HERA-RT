@@ -30,6 +30,7 @@ pub(crate) struct ReduceMaxKernel;
 /// TopK 的静态分发标记。
 pub(crate) struct TopKKernel;
 
+/// Defines a marker that statically routes one NN operator.
 macro_rules! impl_nn_kernel {
     ($marker:ident, $op:expr, $entry:ident) => {
         impl ComputeKernel for $marker {

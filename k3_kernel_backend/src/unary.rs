@@ -25,6 +25,7 @@ pub(crate) struct SigmoidKernel;
 /// Scale 静态分发标记。
 pub(crate) struct ScaleKernel;
 
+/// Defines a marker that statically routes one unary operator.
 macro_rules! impl_kernel {
     ($marker:ident, $op:expr, $kind:expr) => {
         impl ComputeKernel for $marker {
@@ -76,7 +77,7 @@ fn compute_f16_cpu(
     Ok(())
 }
 
-/// FP16 RVV 路径；当前使用同一数值语义的软件镜像。
+/// FP16 RVV 路径；逐元素算子不匹配 IME 的矩阵乘加语义。
 fn compute_f16_rvv(
     kind: UnaryKind,
     attr: UnaryAttr,
@@ -91,11 +92,25 @@ fn compute_f16_rvv(
         .map(|bits| f16::from_bits(*bits).to_f32())
         .collect::<alloc::vec::Vec<_>>();
     let mut computed = vec![0.0_f32; decoded.len()];
-    crate::rvv::f16_sigmoid_work(&decoded, &mut computed)?;
+    match kind {
+        UnaryKind::Sigmoid => crate::rvv::f16_sigmoid_work(&decoded, &mut computed)?,
+        UnaryKind::Silu => {
+            let mut sigmoid = vec![0.0_f32; decoded.len()];
+            crate::rvv::f16_sigmoid_work(&decoded, &mut sigmoid)?;
+            crate::rvv::f16_binary_work(
+                crate::rvv::BinaryOp::Mul,
+                &decoded,
+                &sigmoid,
+                &mut computed,
+            )?;
+        }
+        UnaryKind::Scale => {
+            crate::rvv::f16_affine_work(&decoded, &mut computed, attr.alpha, attr.beta)?;
+        }
+    }
     for (destination, value) in output.iter_mut().zip(computed) {
         *destination = f16::from_f32(value).to_bits();
     }
-    let _ = attr;
     Ok(())
 }
 
@@ -127,6 +142,33 @@ mod tests {
         for (value, output) in values.iter().zip(output) {
             let expected = *value / (1.0 + libm::expf(-*value));
             assert!((f16::from_bits(output).to_f32() - expected).abs() < 1e-2);
+        }
+    }
+
+    /// A100 路径应对每种 unary 语义使用 RVV 原语，并保留 FP16 可表示精度。
+    #[test]
+    fn f16_rvv_unary_matches_reference() {
+        let values = [-2.0_f32, 0.5, 4.0];
+        let input = values.map(|value| f16::from_f32(value).to_bits());
+        let scale = UnaryAttr {
+            alpha: 1.5,
+            beta: -0.25,
+            ..UnaryAttr::default()
+        };
+
+        for (kind, attr) in [
+            (UnaryKind::Silu, UnaryAttr::default()),
+            (UnaryKind::Sigmoid, UnaryAttr::default()),
+            (UnaryKind::Scale, scale),
+        ] {
+            let mut output = [0_u16; 3];
+            compute_f16_rvv(kind, attr, &input, &mut output).unwrap();
+            for (output, expected) in output
+                .into_iter()
+                .zip(values.map(|value| apply(kind, attr, value)))
+            {
+                assert!((f16::from_bits(output).to_f32() - expected).abs() < 2.0e-3);
+            }
         }
     }
 }

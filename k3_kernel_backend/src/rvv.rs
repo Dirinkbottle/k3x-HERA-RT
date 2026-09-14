@@ -168,7 +168,7 @@ pub(crate) fn gather_bytes(
 pub(crate) fn f16_reduce_sum_work(input: &[f32]) -> f32 {
     #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
     unsafe {
-        return reduce_f32_hw(input, false);
+        reduce_f32_hw(input, false)
     }
 
     #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
@@ -179,7 +179,7 @@ pub(crate) fn f16_reduce_sum_work(input: &[f32]) -> f32 {
 pub(crate) fn f16_reduce_max_work(input: &[f32]) -> f32 {
     #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
     unsafe {
-        return reduce_f32_hw(input, true);
+        reduce_f32_hw(input, true)
     }
 
     #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
@@ -222,7 +222,7 @@ unsafe fn binary_f32_hw(op: BinaryOp, lhs: &[f32], rhs: &[f32], output: &mut [f3
                         $instruction,
                         "vse32.v v2, ({output})",
                         ".option pop",
-                        vl = lateout(reg) vl,
+                        vl = out(reg) vl,
                         remaining = in(reg) remaining,
                         lhs = in(reg) lhs_ptr,
                         rhs = in(reg) rhs_ptr,
@@ -265,7 +265,7 @@ unsafe fn affine_f32_hw(input: &[f32], output: &mut [f32], alpha: f32, beta: f32
                 "vfadd.vf v1, v1, ft1",
                 "vse32.v v1, ({output})",
                 ".option pop",
-                vl = lateout(reg) vl,
+                vl = out(reg) vl,
                 remaining = in(reg) remaining,
                 input = in(reg) input.as_ptr().add(offset),
                 output = in(reg) output.as_mut_ptr().add(offset),
@@ -342,7 +342,7 @@ unsafe fn exp_f32_hw(input: &[f32], output: &mut [f32]) {
                 "vfmul.vv v4, v4, v2",
                 "vse32.v v4, ({output})",
                 ".option pop",
-                vl = lateout(reg) vl,
+                vl = out(reg) vl,
                 remaining = in(reg) remaining,
                 input = in(reg) input.as_ptr().add(offset),
                 output = in(reg) output.as_mut_ptr().add(offset),
@@ -380,7 +380,7 @@ unsafe fn reciprocal_one_plus_f32_hw(values: &mut [f32]) {
                 "vfrdiv.vf v0, v0, ft0",
                 "vse32.v v0, ({values})",
                 ".option pop",
-                vl = lateout(reg) vl,
+                vl = out(reg) vl,
                 remaining = in(reg) remaining,
                 values = in(reg) values.as_mut_ptr().add(offset),
                 one = in(reg) &one,
@@ -408,7 +408,7 @@ unsafe fn copy_bytes_hw(source: &[u8], destination: &mut [u8]) {
                 "vle8.v v0, ({source})",
                 "vse8.v v0, ({destination})",
                 ".option pop",
-                vl = lateout(reg) vl,
+                vl = out(reg) vl,
                 remaining = in(reg) remaining,
                 source = in(reg) source.as_ptr().add(offset),
                 destination = in(reg) destination.as_mut_ptr().add(offset),
@@ -444,7 +444,7 @@ unsafe fn gather_bytes_hw(
                         $load,
                         $store,
                         ".option pop",
-                        vl = lateout(reg) vl,
+                        vl = out(reg) vl,
                         remaining = in(reg) remaining,
                         source = in(reg) source.as_ptr(),
                         offsets = in(reg) offsets.as_ptr().add(index),
@@ -490,64 +490,6 @@ unsafe fn gather_bytes_hw(
     }
 }
 
-/// RISC-V I32-to-F32 conversion。
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-unsafe fn cast_i32_to_f32_hw(input: &[i32], output: &mut [f32]) {
-    let mut offset = 0_usize;
-    while offset < input.len() {
-        let remaining = input.len() - offset;
-        let vl: usize;
-        unsafe {
-            core::arch::asm!(
-                ".option push",
-                ".option arch, +v",
-                "vsetvli {vl}, {remaining}, e32, m1, ta, ma",
-                "vle32.v v0, ({input})",
-                "vfcvt.f.x.v v1, v0",
-                "vse32.v v1, ({output})",
-                ".option pop",
-                vl = lateout(reg) vl,
-                remaining = in(reg) remaining,
-                input = in(reg) input.as_ptr().add(offset),
-                output = in(reg) output.as_mut_ptr().add(offset),
-                out("v0") _,
-                out("v1") _,
-                options(nostack),
-            );
-        }
-        offset += vl;
-    }
-}
-
-/// RISC-V F32-to-I32 conversion。
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-unsafe fn cast_f32_to_i32_hw(input: &[f32], output: &mut [i32]) {
-    let mut offset = 0_usize;
-    while offset < input.len() {
-        let remaining = input.len() - offset;
-        let vl: usize;
-        unsafe {
-            core::arch::asm!(
-                ".option push",
-                ".option arch, +v",
-                "vsetvli {vl}, {remaining}, e32, m1, ta, ma",
-                "vle32.v v0, ({input})",
-                "vfcvt.rtz.x.f.v v1, v0",
-                "vse32.v v1, ({output})",
-                ".option pop",
-                vl = lateout(reg) vl,
-                remaining = in(reg) remaining,
-                input = in(reg) input.as_ptr().add(offset),
-                output = in(reg) output.as_mut_ptr().add(offset),
-                out("v0") _,
-                out("v1") _,
-                options(nostack),
-            );
-        }
-        offset += vl;
-    }
-}
-
 /// RISC-V F32 sum/max reduction。
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 unsafe fn reduce_f32_hw(input: &[f32], maximum: bool) -> f32 {
@@ -572,7 +514,7 @@ unsafe fn reduce_f32_hw(input: &[f32], maximum: bool) -> f32 {
                         "vsetivli zero, 1, e32, m1, ta, ma",
                         "vse32.v v2, ({output})",
                         ".option pop",
-                        vl = lateout(reg) vl,
+                        vl = out(reg) vl,
                         remaining = in(reg) remaining,
                         input = in(reg) input.as_ptr().add(offset),
                         seed = in(reg) &seed,
@@ -629,5 +571,18 @@ mod tests {
         assert_eq!(output, [-3.0, 1.0, 5.0]);
         f16_sigmoid_work(&input, &mut output).unwrap();
         assert!((output[1] - 0.5).abs() < 1.0e-6);
+    }
+
+    /// `vsetvli` writes `vl` before later instructions consume pointer inputs, so the
+    /// output is an early clobber rather than a late output.
+    #[test]
+    fn vsetvli_length_outputs_are_early_clobbers() {
+        const RVV_SOURCE: &str = include_str!("rvv.rs");
+        const LATE_OUTPUT: &str = concat!("vl = late", "out(reg) vl");
+
+        assert!(
+            !RVV_SOURCE.contains(LATE_OUTPUT),
+            "vsetvli output must not overlap a pointer used later in the asm template"
+        );
     }
 }

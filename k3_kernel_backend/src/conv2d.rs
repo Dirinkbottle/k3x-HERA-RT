@@ -30,23 +30,29 @@ struct Conv2dGeom {
     cin: usize,
     /// 输出通道数。
     cout: usize,
-    /// 输入高宽。
+    /// Input height.
     ih: usize,
+    /// Input width.
     iw: usize,
-    /// 输出高宽。
+    /// Output height.
     oh: usize,
+    /// Output width.
     ow: usize,
-    /// 卷积核高宽。
+    /// Kernel height.
     kh: usize,
+    /// Kernel width.
     kw: usize,
-    /// stride。
+    /// Vertical stride.
     sh: usize,
+    /// Horizontal stride.
     sw: usize,
-    /// padding。
+    /// Vertical padding.
     ph: usize,
+    /// Horizontal padding.
     pw: usize,
-    /// dilation。
+    /// Vertical dilation.
     dh: usize,
+    /// Horizontal dilation.
     dw: usize,
     /// 分组数量。
     groups: usize,
